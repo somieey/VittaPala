@@ -1,0 +1,319 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =========================================================
+   GLOBAL
+========================================================= */
+
+:root {
+  font-family: "Inter", sans-serif;
+
+  color: #cbd5e1;
+  background: #070b11;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  background: #070b11;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+
+  background:
+    radial-gradient(
+      circle at 85% 10%,
+      rgba(34, 211, 238, 0.035),
+      transparent 28%
+    ),
+    #070b11;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* =========================================================
+   SCROLLBAR
+========================================================= */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #070b11;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+/* =========================================================
+   SELECTION
+========================================================= */
+
+::selection {
+  background: rgba(34, 211, 238, 0.2);
+  color: #e2e8f0;
+}
+
+/* =========================================================
+   FORM ELEMENTS
+========================================================= */
+
+input::placeholder,
+textarea::placeholder {
+  color: #475569;
+}
+
+select option {
+  background: #0b111b;
+  color: #cbd5e1;
+}
+
+/* =========================================================
+   MONOSPACE DATA
+========================================================= */
+
+.font-mono-data {
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* =========================================================
+   CYBERSECURITY GRID
+========================================================= */
+
+.cyber-grid {
+  background-image:
+    linear-gradient(
+      rgba(148, 163, 184, 0.025) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(148, 163, 184, 0.025) 1px,
+      transparent 1px
+    );
+
+  background-size: 32px 32px;
+}
+
+/* =========================================================
+   GLASS PANEL
+========================================================= */
+
+.glass-panel {
+  background: rgba(11, 17, 27, 0.78);
+
+  border: 1px solid rgba(51, 65, 85, 0.65);
+
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* =========================================================
+   PANEL HOVER
+========================================================= */
+
+.panel-hover {
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease,
+    transform 180ms ease;
+}
+
+.panel-hover:hover {
+  border-color: rgba(71, 85, 105, 0.8);
+  background-color: rgba(15, 23, 42, 0.7);
+}
+
+/* =========================================================
+   RISK STATUS
+========================================================= */
+
+.risk-critical {
+  color: #f87171;
+}
+
+.risk-high {
+  color: #fb923c;
+}
+
+.risk-medium {
+  color: #facc15;
+}
+
+.risk-low {
+  color: #34d399;
+}
+
+/* =========================================================
+   STATUS DOT
+========================================================= */
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+
+  border-radius: 50%;
+
+  display: inline-block;
+}
+
+.status-dot-critical {
+  background: #f87171;
+  box-shadow: 0 0 8px rgba(248, 113, 113, 0.45);
+}
+
+.status-dot-high {
+  background: #fb923c;
+  box-shadow: 0 0 8px rgba(251, 146, 60, 0.4);
+}
+
+.status-dot-medium {
+  background: #facc15;
+  box-shadow: 0 0 8px rgba(250, 204, 21, 0.35);
+}
+
+.status-dot-low {
+  background: #34d399;
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.35);
+}
+
+/* =========================================================
+   ANIMATIONS
+========================================================= */
+
+@keyframes pulseSoft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.animate-pulse-soft {
+  animation: pulseSoft 2s ease-in-out infinite;
+}
+
+@keyframes scanLine {
+  0% {
+    transform: translateY(-100%);
+  }
+
+  100% {
+    transform: translateY(100%);
+  }
+}
+
+.scan-line {
+  animation: scanLine 4s linear infinite;
+}
+
+/* =========================================================
+   TABLE
+========================================================= */
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.data-table th {
+  padding: 10px 12px;
+
+  text-align: left;
+
+  font-size: 9px;
+  font-weight: 600;
+
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+
+  color: #475569;
+
+  border-bottom: 1px solid #1e293b;
+}
+
+.data-table td {
+  padding: 11px 12px;
+
+  font-size: 10px;
+
+  color: #94a3b8;
+
+  border-bottom: 1px solid rgba(30, 41, 59, 0.7);
+}
+
+.data-table tbody tr {
+  transition: background-color 150ms ease;
+}
+
+.data-table tbody tr:hover {
+  background: rgba(30, 41, 59, 0.25);
+}
+
+/* =========================================================
+   FOCUS
+========================================================= */
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+}
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media (max-width: 768px) {
+  body {
+    overflow-x: hidden;
+  }
+
+  .data-table {
+    min-width: 700px;
+  }
+}
