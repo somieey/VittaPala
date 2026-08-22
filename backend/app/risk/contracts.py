@@ -35,6 +35,9 @@ class TransactionData(BaseModel):
     status: str | None = None
     merchant_category: str | None = None
 
+    sender_account_id: int | None = None
+    receiver_account_id: int | None = None
+
 
 class AccountData(BaseModel):
     account_id: int
