@@ -7,10 +7,13 @@ from .contracts import RiskEngine, RiskLevel
 
 # Pattern code → database alert_type
 ALERT_TYPE_MAP = {
-    "large_transaction": "anomalous_transaction",
-    "new_account": "anomalous_transaction",
-    "new_device": "anomalous_transaction",
-    "high_velocity": "rapid_movement",
+    "LARGE_TRANSACTION": "anomalous_transaction",
+    "NEW_ACCOUNT": "mule_account",
+    "NEW_DEVICE": "anomalous_transaction",
+    "NEW_LOCATION": "anomalous_transaction",
+    "NEW_RECEIVER": "anomalous_transaction",
+    "HIGH_VELOCITY": "rapid_movement",
+    "STRUCTURING": "structuring",
 }
 
 
@@ -80,12 +83,16 @@ def analyze_transaction(
     # 5. Create fraud alerts
     # ---------------------------------
 
+    # Tracks the alert_type used by the generic alert below, so the
+    # pattern loop can avoid emitting a duplicate of it.
+    generic_alert_type = None
+
     if result.risk_level in (
         RiskLevel.HIGH,
         RiskLevel.CRITICAL,
     ):
 
-        alert_type = (
+        generic_alert_type = (
             "mule_account"
             if result.mule_probability >= 0.8
             else "anomalous_transaction"
@@ -97,7 +104,7 @@ def analyze_transaction(
                 account_id=context.account.account_id,
                 transaction_id=transaction_id,
                 risk_score_id=risk_score.risk_score_id,
-                alert_type=alert_type,
+                alert_type=generic_alert_type,
                 severity=result.risk_level.value,
                 status="open",
                 reason="; ".join(
@@ -119,15 +126,9 @@ def analyze_transaction(
         if not mapped_alert_type:
             continue
 
-        # Avoid creating another alert for the same
-        # transaction if it is already represented above.
-        if (
-            mapped_alert_type == "anomalous_transaction"
-            and result.risk_level not in (
-                RiskLevel.HIGH,
-                RiskLevel.CRITICAL,
-            )
-        ):
+        # Avoid creating another alert for the same transaction if
+        # the generic alert above already used this alert_type.
+        if mapped_alert_type == generic_alert_type:
             continue
 
         db.add(
