@@ -10,7 +10,7 @@ app = FastAPI(
 @app.get("/")
 def root():
     return {
-        "message": "MuleGuard API is running"
+        "message": "VittaPala API is running"
     }
 
 
