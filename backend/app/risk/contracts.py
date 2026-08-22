@@ -22,8 +22,11 @@ class TransactionData(BaseModel):
     amount: Decimal
     channel: str | None = None
     transaction_timestamp: datetime
-
     device_fingerprint: str | None = None
+
+    sender_account_id: int | None = None
+    receiver_account_id: int | None = None
+
     device_id: str | None = None
     ip_address: str | None = None
     location: str | None = None
