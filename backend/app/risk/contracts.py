@@ -67,6 +67,32 @@ class DetectedPattern(BaseModel):
     description: str
     severity: RiskLevel
 
+    # ---- Explainability -------------------------------------------------
+    # All optional with defaults, so any engine or caller written against
+    # the original three-field shape keeps working unchanged.
+
+    # Stable identifier of the rule that fired. Mirrors `code`; kept as a
+    # separate field because downstream consumers ask for `rule_id`.
+    rule_id: str | None = None
+
+    # Human-readable rule name, e.g. "Rapid movement of funds".
+    rule_name: str | None = None
+
+    # Points this rule contributed before cross-rule discounting.
+    score_contribution: float | None = None
+
+    # 0..1 — how much evidence backed this finding, not how bad it is.
+    confidence: float | None = None
+
+    # The account the finding is about.
+    account_id: int | None = None
+
+    # Transactions that constitute the evidence for this finding.
+    transaction_ids: list[int] = Field(default_factory=list)
+
+    # Raw supporting metrics (counts, ratios, windows).
+    evidence: dict = Field(default_factory=dict)
+
 
 class RiskResult(BaseModel):
     anomaly_score: float | None = None

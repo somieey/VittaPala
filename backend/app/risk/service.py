@@ -14,6 +14,28 @@ ALERT_TYPE_MAP = {
     "NEW_RECEIVER": "anomalous_transaction",
     "HIGH_VELOCITY": "rapid_movement",
     "STRUCTURING": "structuring",
+
+    # Loophole / mule-behaviour rules.
+    "RAPID_MOVEMENT": "rapid_movement",
+    "BURST_ACTIVITY": "rapid_movement",
+    "PASS_THROUGH": "mule_account",
+    "DORMANT_ACTIVATION": "mule_account",
+    "FAN_IN": "network_pattern",
+    "FAN_OUT": "network_pattern",
+    "CIRCULAR_FLOW": "network_pattern",
+    "DEVICE_REUSE": "network_pattern",
+    "LOCATION_ANOMALY": "anomalous_transaction",
+    "FAILED_BURST": "anomalous_transaction",
+}
+
+
+# Severity ordering, used to keep the most serious reason when several
+# patterns collapse onto the same alert_type.
+_SEVERITY_RANK = {
+    "critical": 3,
+    "high": 2,
+    "medium": 1,
+    "low": 0,
 }
 
 
@@ -117,7 +139,23 @@ def analyze_transaction(
     # 6. Create pattern-specific alerts
     # ---------------------------------
 
-    for pattern in result.detected_patterns:
+    # Most severe first, so the alert kept for each alert_type carries the
+    # most serious reason. Ties break on code for a deterministic result.
+    ordered_patterns = sorted(
+        result.detected_patterns,
+        key=lambda p: (
+            -_SEVERITY_RANK.get(p.severity.value, 0),
+            p.code,
+        ),
+    )
+
+    # Tracks every alert_type already written for this analysis.
+    created_alert_types = set()
+
+    if generic_alert_type:
+        created_alert_types.add(generic_alert_type)
+
+    for pattern in ordered_patterns:
 
         mapped_alert_type = ALERT_TYPE_MAP.get(
             pattern.code
@@ -126,10 +164,12 @@ def analyze_transaction(
         if not mapped_alert_type:
             continue
 
-        # Avoid creating another alert for the same transaction if
-        # the generic alert above already used this alert_type.
-        if mapped_alert_type == generic_alert_type:
+        # One alert per alert_type. Covers both the generic alert above
+        # and earlier patterns that mapped onto the same type.
+        if mapped_alert_type in created_alert_types:
             continue
+
+        created_alert_types.add(mapped_alert_type)
 
         db.add(
             FraudAlert(

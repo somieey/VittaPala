@@ -12,9 +12,10 @@ from app.risk.contracts import (
     RiskEngine,
     RiskLevel,
     DetectedPattern,
+    TransactionData,
 )
  
-MODEL_VERSION = "rule_based-0.2.0"
+MODEL_VERSION = "rule_based-0.3.0"
  
 # --------------------------------------------------------------------------- #
 # Tunable thresholds (kept from the design we agreed on earlier).
@@ -62,6 +63,84 @@ NEW_ACCOUNT_POINTS_VERY_RECENT = 30.0
 # mule_probability = logistic(risk_score): a smooth 0..1 S-curve.
 MULE_MIDPOINT = 50.0
 MULE_STEEPNESS = 0.08
+
+# --------------------------------------------------------------------------- #
+# Loophole / mule-behaviour thresholds. Every constant below is a tuning
+# knob; no rule hardcodes a value inline.
+# --------------------------------------------------------------------------- #
+
+# RAPID_MOVEMENT - money in, money straight back out.
+RAPID_MOVEMENT_WINDOW_MIN = 60      # how long after an inflow still counts
+RAPID_MOVEMENT_MIN_RATIO = 0.60     # outflow must move >=60% of the inflow
+RAPID_MOVEMENT_FAST_MIN = 10        # under this many minutes -> HIGH
+RAPID_MOVEMENT_BASE_POINTS = 18.0
+RAPID_MOVEMENT_SPEED_POINTS = 22.0  # added in full when the gap is ~zero
+RAPID_MOVEMENT_MAX_POINTS = 40.0
+
+# BURST_ACTIVITY - a tighter window than HIGH_VELOCITY.
+BURST_WINDOW_MIN = 15
+BURST_MIN_COUNT = 5                 # including the current transaction
+BURST_BASE_POINTS = 22.0
+BURST_POINTS_PER_EXTRA = 5.0
+BURST_MAX_POINTS = 38.0
+
+# FAN_IN / FAN_OUT - many-to-one and one-to-many counterparty spread.
+FAN_WINDOW_HOURS = 24
+FAN_IN_MIN_SENDERS = 5
+FAN_OUT_MIN_RECEIVERS = 5
+FAN_BASE_POINTS = 24.0
+FAN_POINTS_PER_EXTRA = 4.0
+FAN_MAX_POINTS = 42.0
+
+# PASS_THROUGH - what comes in goes straight back out again.
+PASS_THROUGH_WINDOW_HOURS = 24
+PASS_THROUGH_MIN_INFLOW = 10_000.0  # ignore trivial sums
+PASS_THROUGH_MIN_LEGS = 2
+PASS_THROUGH_MIN_RATIO = 0.80       # outflow/inflow band that reads as transit
+PASS_THROUGH_MAX_RATIO = 1.20
+PASS_THROUGH_POINTS = 30.0
+
+# DORMANT_ACTIVATION - long quiet spell, then sudden movement.
+DORMANT_MAX_PRIOR_TXNS = 2          # activity before the history window
+DORMANT_MIN_ACCOUNT_AGE_DAYS = 90   # a new account is NEW_ACCOUNT, not dormant
+DORMANT_MIN_AMOUNT = 25_000.0
+DORMANT_MIN_RECENT_COUNT = 5
+DORMANT_POINTS = 28.0
+
+# DEVICE_REUSE - a shared fingerprint is a signal, never proof by itself.
+DEVICE_REUSE_MIN_ACCOUNTS = 2
+DEVICE_REUSE_HIGH_ACCOUNTS = 4
+DEVICE_REUSE_BASE_POINTS = 16.0
+DEVICE_REUSE_POINTS_PER_EXTRA = 6.0
+DEVICE_REUSE_MAX_POINTS = 34.0
+
+# LOCATION_ANOMALY - several places in an implausibly short span.
+LOCATION_WINDOW_HOURS = 6
+LOCATION_MIN_DISTINCT = 2
+LOCATION_BASE_POINTS = 14.0
+LOCATION_POINTS_PER_EXTRA = 8.0
+LOCATION_MAX_POINTS = 30.0
+
+# FAILED_BURST - clusters of failed or reversed attempts.
+FAILED_WINDOW_HOURS = 24
+FAILED_MIN_COUNT = 3
+FAILED_BASE_POINTS = 12.0
+FAILED_POINTS_PER_EXTRA = 4.0
+FAILED_MAX_POINTS = 26.0
+
+# CIRCULAR_FLOW - money going back and forth with the same counterparty.
+CIRCULAR_WINDOW_HOURS = 72
+CIRCULAR_MIN_LEGS = 4
+CIRCULAR_POINTS = 26.0
+
+# --------------------------------------------------------------------------- #
+# Score combination. Rules reading the same evidence sit in one family and
+# are discounted against each other, so a single behaviour observed by two
+# rules cannot be counted twice at full weight.
+# --------------------------------------------------------------------------- #
+
+FAMILY_WITHIN_DECAY = 0.35      # weight of the 2nd..nth rule inside a family
+FAMILY_ACROSS_DECAY = 0.90      # weight decay across independent families
  
  
 # --------------------------------------------------------------------------- #
@@ -77,6 +156,8 @@ class _RuleHit:
     reason: str
     anomaly: float = 0.0            # transaction-level anomaly contribution (0..1)
     details: dict = field(default_factory=dict)
+    confidence: Optional[float] = None      # 0..1 evidence strength
+    transaction_ids: list = field(default_factory=list)
  
  
 def _to_float(x) -> float:
@@ -302,9 +383,650 @@ def _rule_new_account(ctx: RiskContext) -> Optional[_RuleHit]:
  
  
 # --------------------------------------------------------------------------- #
+# Loophole rules - shared evidence helpers
+# --------------------------------------------------------------------------- #
+
+
+def _is_outgoing(t: TransactionData, account_id: int) -> bool:
+    return t.sender_account_id == account_id
+
+
+def _is_incoming(t: TransactionData, account_id: int) -> bool:
+    return t.receiver_account_id == account_id
+
+
+def _is_settled(t: TransactionData) -> bool:
+    """Money actually moved. Failed/reversed legs never moved funds."""
+    return (t.status or "completed").lower() not in ("failed", "reversed")
+
+
+def _is_failed(t: TransactionData) -> bool:
+    return (t.status or "").lower() in ("failed", "reversed")
+
+
+def _age_seconds(cur_ts: datetime, t: TransactionData) -> float:
+    """Seconds between t and the transaction under analysis. Negative = later."""
+    return (cur_ts - _naive(t.transaction_timestamp)).total_seconds()
+
+
+def _preceding(cur_ts: datetime, t: TransactionData, window_s: float) -> bool:
+    """True when t sits inside the trailing window (not in the future)."""
+    delta = _age_seconds(cur_ts, t)
+    return 0 <= delta <= window_s
+
+
+def _surrounding(cur_ts: datetime, t: TransactionData, window_s: float) -> bool:
+    """True when t sits within the window on either side."""
+    return abs(_age_seconds(cur_ts, t)) <= window_s
+
+
+def _confidence(observed: int, full_at: int) -> float:
+    """
+    Evidence strength on 0..1 - how much corroboration the finding rests on,
+    which is deliberately separate from how severe the finding is.
+    """
+    if full_at <= 0:
+        return 1.0
+    return round(min(1.0, observed / float(full_at)), 4)
+
+
+def _account_age_days(ctx: RiskContext) -> Optional[int]:
+    opened = ctx.account.date_opened
+    if opened is None:
+        return None
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    if isinstance(opened, datetime):
+        opened_dt = _naive(opened)
+    else:
+        opened_dt = datetime(opened.year, opened.month, opened.day)
+    return (cur_ts - opened_dt).days
+
+
+# --------------------------------------------------------------------------- #
+# Loophole rules
+# --------------------------------------------------------------------------- #
+
+
+def _rule_rapid_movement(ctx: RiskContext) -> Optional[_RuleHit]:
+    """Funds arrive and are pushed straight back out - classic mule hop."""
+    account_id = ctx.account.account_id
+    current = ctx.transaction
+
+    if not _is_outgoing(current, account_id) or not _is_settled(current):
+        return None
+
+    cur_ts = _naive(current.transaction_timestamp)
+    cur_amount = _to_float(current.amount)
+    window_s = RAPID_MOVEMENT_WINDOW_MIN * 60
+
+    # The closest preceding inflow is the one this outflow most likely drains.
+    inflow = None
+    inflow_delta = None
+
+    for t in ctx.recent_transactions:
+        if not _is_incoming(t, account_id) or not _is_settled(t):
+            continue
+        delta = _age_seconds(cur_ts, t)
+        if 0 <= delta <= window_s and (inflow_delta is None or delta < inflow_delta):
+            inflow, inflow_delta = t, delta
+
+    if inflow is None:
+        return None
+
+    inflow_amount = _to_float(inflow.amount)
+    if inflow_amount <= 0:
+        return None
+
+    ratio = cur_amount / inflow_amount
+    if ratio < RAPID_MOVEMENT_MIN_RATIO:
+        return None
+
+    minutes = inflow_delta / 60.0
+    speed = 1.0 - (inflow_delta / window_s)     # 1.0 = instant, 0.0 = window edge
+
+    points = min(
+        RAPID_MOVEMENT_MAX_POINTS,
+        RAPID_MOVEMENT_BASE_POINTS + speed * RAPID_MOVEMENT_SPEED_POINTS,
+    )
+
+    inflow_legs = sum(
+        1
+        for t in ctx.recent_transactions
+        if _is_incoming(t, account_id) and _preceding(cur_ts, t, window_s)
+    )
+
+    severity = (
+        RiskLevel.HIGH if minutes <= RAPID_MOVEMENT_FAST_MIN else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"₹{cur_amount:,.0f} left the account {minutes:.0f} minute(s) after "
+        f"₹{inflow_amount:,.0f} arrived ({ratio * 100:.0f}% of the incoming "
+        f"amount) - funds were not held, only forwarded."
+    )
+
+    return _RuleHit(
+        "RAPID_MOVEMENT", points, severity, reason, 0.30,
+        {
+            "inflow_transaction_id": inflow.transaction_id,
+            "inflow_amount": inflow_amount,
+            "outflow_amount": cur_amount,
+            "forwarded_ratio": round(ratio, 4),
+            "minutes_between": round(minutes, 2),
+            "window_minutes": RAPID_MOVEMENT_WINDOW_MIN,
+            "inflow_legs_in_window": inflow_legs,
+        },
+        confidence=_confidence(inflow_legs, 2),
+        transaction_ids=[inflow.transaction_id, current.transaction_id],
+    )
+
+
+def _rule_burst_activity(ctx: RiskContext) -> Optional[_RuleHit]:
+    """A tight burst of transactions - tighter than HIGH_VELOCITY."""
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = BURST_WINDOW_MIN * 60
+
+    ids = [ctx.transaction.transaction_id]
+    ids.extend(
+        t.transaction_id
+        for t in ctx.recent_transactions
+        if _surrounding(cur_ts, t, window_s)
+    )
+
+    count = len(ids)
+    if count < BURST_MIN_COUNT:
+        return None
+
+    points = min(
+        BURST_MAX_POINTS,
+        BURST_BASE_POINTS + (count - BURST_MIN_COUNT) * BURST_POINTS_PER_EXTRA,
+    )
+
+    severity = (
+        RiskLevel.HIGH if count >= BURST_MIN_COUNT + 3 else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"{count} transactions inside a {BURST_WINDOW_MIN}-minute window - a burst "
+        f"far tighter than normal account use."
+    )
+
+    return _RuleHit(
+        "BURST_ACTIVITY", points, severity, reason, 0.25,
+        {
+            "count_in_window": count,
+            "window_minutes": BURST_WINDOW_MIN,
+            "trigger_count": BURST_MIN_COUNT,
+        },
+        confidence=_confidence(count, BURST_MIN_COUNT + 3),
+        transaction_ids=sorted(ids),
+    )
+
+
+def _rule_fan_in(ctx: RiskContext) -> Optional[_RuleHit]:
+    """Many distinct senders paying into one account (many-to-one)."""
+    account_id = ctx.account.account_id
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = FAN_WINDOW_HOURS * 3600
+
+    senders = set()
+    ids = []
+    total = 0.0
+
+    legs = [ctx.transaction] + [
+        t for t in ctx.recent_transactions if _preceding(cur_ts, t, window_s)
+    ]
+
+    for t in legs:
+        if not _is_incoming(t, account_id) or not _is_settled(t):
+            continue
+        if t.sender_account_id is None:
+            continue
+        senders.add(t.sender_account_id)
+        ids.append(t.transaction_id)
+        total += _to_float(t.amount)
+
+    if len(senders) < FAN_IN_MIN_SENDERS:
+        return None
+
+    points = min(
+        FAN_MAX_POINTS,
+        FAN_BASE_POINTS + (len(senders) - FAN_IN_MIN_SENDERS) * FAN_POINTS_PER_EXTRA,
+    )
+
+    severity = (
+        RiskLevel.HIGH
+        if len(senders) >= FAN_IN_MIN_SENDERS + 3
+        else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"{len(senders)} different accounts paid a total of ₹{total:,.0f} into "
+        f"this account within {FAN_WINDOW_HOURS}h - collection behaviour typical of "
+        f"a funnel account."
+    )
+
+    return _RuleHit(
+        "FAN_IN", points, severity, reason, 0.25,
+        {
+            "distinct_senders": len(senders),
+            "sender_account_ids": sorted(senders),
+            "total_inflow": round(total, 2),
+            "window_hours": FAN_WINDOW_HOURS,
+        },
+        confidence=_confidence(len(senders), FAN_IN_MIN_SENDERS + 3),
+        transaction_ids=sorted(ids),
+    )
+
+
+def _rule_fan_out(ctx: RiskContext) -> Optional[_RuleHit]:
+    """One account distributing to many receivers (one-to-many)."""
+    account_id = ctx.account.account_id
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = FAN_WINDOW_HOURS * 3600
+
+    receivers = set()
+    ids = []
+    total = 0.0
+
+    legs = [ctx.transaction] + [
+        t for t in ctx.recent_transactions if _preceding(cur_ts, t, window_s)
+    ]
+
+    for t in legs:
+        if not _is_outgoing(t, account_id) or not _is_settled(t):
+            continue
+        if t.receiver_account_id is None:
+            continue
+        receivers.add(t.receiver_account_id)
+        ids.append(t.transaction_id)
+        total += _to_float(t.amount)
+
+    if len(receivers) < FAN_OUT_MIN_RECEIVERS:
+        return None
+
+    points = min(
+        FAN_MAX_POINTS,
+        FAN_BASE_POINTS
+        + (len(receivers) - FAN_OUT_MIN_RECEIVERS) * FAN_POINTS_PER_EXTRA,
+    )
+
+    severity = (
+        RiskLevel.HIGH
+        if len(receivers) >= FAN_OUT_MIN_RECEIVERS + 3
+        else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"Funds were split across {len(receivers)} different receivers totalling "
+        f"₹{total:,.0f} within {FAN_WINDOW_HOURS}h - rapid distribution rather "
+        f"than ordinary spending."
+    )
+
+    return _RuleHit(
+        "FAN_OUT", points, severity, reason, 0.25,
+        {
+            "distinct_receivers": len(receivers),
+            "receiver_account_ids": sorted(receivers),
+            "total_outflow": round(total, 2),
+            "window_hours": FAN_WINDOW_HOURS,
+        },
+        confidence=_confidence(len(receivers), FAN_OUT_MIN_RECEIVERS + 3),
+        transaction_ids=sorted(ids),
+    )
+
+
+def _rule_pass_through(ctx: RiskContext) -> Optional[_RuleHit]:
+    """Nearly everything received is sent on - a transit account, not a wallet."""
+    account_id = ctx.account.account_id
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = PASS_THROUGH_WINDOW_HOURS * 3600
+
+    inflow_total = 0.0
+    outflow_total = 0.0
+    in_ids = []
+    out_ids = []
+
+    legs = [ctx.transaction] + [
+        t for t in ctx.recent_transactions if _preceding(cur_ts, t, window_s)
+    ]
+
+    for t in legs:
+        if not _is_settled(t):
+            continue
+        if _is_incoming(t, account_id):
+            inflow_total += _to_float(t.amount)
+            in_ids.append(t.transaction_id)
+        elif _is_outgoing(t, account_id):
+            outflow_total += _to_float(t.amount)
+            out_ids.append(t.transaction_id)
+
+    if inflow_total < PASS_THROUGH_MIN_INFLOW:
+        return None
+
+    if not in_ids or not out_ids:
+        return None
+
+    if len(in_ids) + len(out_ids) < PASS_THROUGH_MIN_LEGS:
+        return None
+
+    ratio = outflow_total / inflow_total
+
+    if not (PASS_THROUGH_MIN_RATIO <= ratio <= PASS_THROUGH_MAX_RATIO):
+        return None
+
+    retained = inflow_total - outflow_total
+
+    reason = (
+        f"₹{inflow_total:,.0f} in and ₹{outflow_total:,.0f} out over "
+        f"{PASS_THROUGH_WINDOW_HOURS}h ({ratio * 100:.0f}% forwarded, only "
+        f"₹{retained:,.0f} retained) - the account is being used to move money "
+        f"through rather than to hold it."
+    )
+
+    return _RuleHit(
+        "PASS_THROUGH", PASS_THROUGH_POINTS, RiskLevel.HIGH, reason, 0.30,
+        {
+            "inflow_total": round(inflow_total, 2),
+            "outflow_total": round(outflow_total, 2),
+            "forwarded_ratio": round(ratio, 4),
+            "retained_amount": round(retained, 2),
+            "inflow_legs": len(in_ids),
+            "outflow_legs": len(out_ids),
+            "window_hours": PASS_THROUGH_WINDOW_HOURS,
+        },
+        confidence=_confidence(len(in_ids) + len(out_ids), 4),
+        transaction_ids=sorted(set(in_ids + out_ids)),
+    )
+
+
+def _rule_dormant_activation(ctx: RiskContext) -> Optional[_RuleHit]:
+    """An account that was quiet for months suddenly starts moving money."""
+    prior_count = ctx.related_data.get("prior_activity_count")
+
+    # Without the long-lookback aggregate there is no way to tell dormant
+    # from simply new, so the rule stays silent.
+    if prior_count is None:
+        return None
+
+    if prior_count > DORMANT_MAX_PRIOR_TXNS:
+        return None
+
+    age_days = _account_age_days(ctx)
+
+    # A brand-new account is NEW_ACCOUNT's job, not dormancy.
+    if age_days is None or age_days < DORMANT_MIN_ACCOUNT_AGE_DAYS:
+        return None
+
+    amount = _to_float(ctx.transaction.amount)
+    recent_count = len(ctx.recent_transactions) + 1
+
+    high_value = amount >= DORMANT_MIN_AMOUNT
+    high_frequency = recent_count >= DORMANT_MIN_RECENT_COUNT
+
+    if not (high_value or high_frequency):
+        return None
+
+    quiet_days = ctx.related_data.get("days_since_previous_activity")
+    prior_days = ctx.related_data.get("prior_activity_days", "?")
+
+    if high_value and high_frequency:
+        trigger = f"₹{amount:,.0f} and {recent_count} transactions"
+    elif high_value:
+        trigger = f"₹{amount:,.0f}"
+    else:
+        trigger = f"{recent_count} transactions"
+
+    quiet_phrase = (
+        f" after {quiet_days:.0f} quiet day(s)"
+        if isinstance(quiet_days, (int, float))
+        else ""
+    )
+
+    reason = (
+        f"Account is {age_days} day(s) old but recorded only {prior_count} "
+        f"transaction(s) in the {prior_days} days before this window, then moved "
+        f"{trigger}{quiet_phrase} - dormant accounts waking up suddenly are a "
+        f"common mule-recruitment pattern."
+    )
+
+    return _RuleHit(
+        "DORMANT_ACTIVATION", DORMANT_POINTS, RiskLevel.HIGH, reason, 0.25,
+        {
+            "prior_activity_count": prior_count,
+            "prior_activity_days": prior_days,
+            "days_since_previous_activity": quiet_days,
+            "account_age_days": age_days,
+            "current_amount": amount,
+            "recent_transaction_count": recent_count,
+            "triggered_by_value": high_value,
+            "triggered_by_frequency": high_frequency,
+        },
+        confidence=_confidence(2 if (high_value and high_frequency) else 1, 2),
+        transaction_ids=[ctx.transaction.transaction_id],
+    )
+
+
+def _rule_device_reuse(ctx: RiskContext) -> Optional[_RuleHit]:
+    """
+    One device operating several accounts. Treated as a risk signal that
+    needs corroboration - shared phones and family devices are legitimate.
+    """
+    account_ids = ctx.related_data.get("device_account_ids") or []
+
+    if len(account_ids) < DEVICE_REUSE_MIN_ACCOUNTS:
+        return None
+
+    fingerprint = (
+        ctx.related_data.get("device_fingerprint")
+        or ctx.transaction.device_fingerprint
+    )
+
+    others = sorted(a for a in account_ids if a != ctx.account.account_id)
+
+    points = min(
+        DEVICE_REUSE_MAX_POINTS,
+        DEVICE_REUSE_BASE_POINTS
+        + (len(account_ids) - DEVICE_REUSE_MIN_ACCOUNTS)
+        * DEVICE_REUSE_POINTS_PER_EXTRA,
+    )
+
+    severity = (
+        RiskLevel.HIGH
+        if len(account_ids) >= DEVICE_REUSE_HIGH_ACCOUNTS
+        else RiskLevel.MEDIUM
+    )
+
+    lookback = ctx.related_data.get("device_lookback_days", "?")
+
+    reason = (
+        f"Device '{fingerprint}' has operated {len(account_ids)} different accounts "
+        f"in the last {lookback} days (also: "
+        f"{', '.join(map(str, others)) or 'none'}). Shared devices have innocent "
+        f"explanations, so this is a supporting signal rather than proof."
+    )
+
+    return _RuleHit(
+        "DEVICE_REUSE", points, severity, reason, 0.20,
+        {
+            "device_fingerprint": fingerprint,
+            "account_count": len(account_ids),
+            "account_ids": sorted(account_ids),
+            "other_account_ids": others,
+            "lookback_days": lookback,
+            "signal_only": True,
+        },
+        confidence=_confidence(len(account_ids), DEVICE_REUSE_HIGH_ACCOUNTS),
+        transaction_ids=[ctx.transaction.transaction_id],
+    )
+
+
+def _rule_location_anomaly(ctx: RiskContext) -> Optional[_RuleHit]:
+    """Several distinct locations inside a window too short to travel it."""
+    current = ctx.transaction
+
+    if not current.location:
+        return None
+
+    cur_ts = _naive(current.transaction_timestamp)
+    window_s = LOCATION_WINDOW_HOURS * 3600
+
+    locations = {current.location: [current.transaction_id]}
+
+    for t in ctx.recent_transactions:
+        if t.location and _preceding(cur_ts, t, window_s):
+            locations.setdefault(t.location, []).append(t.transaction_id)
+
+    if len(locations) < LOCATION_MIN_DISTINCT:
+        return None
+
+    points = min(
+        LOCATION_MAX_POINTS,
+        LOCATION_BASE_POINTS
+        + (len(locations) - LOCATION_MIN_DISTINCT) * LOCATION_POINTS_PER_EXTRA,
+    )
+
+    severity = (
+        RiskLevel.HIGH if len(locations) >= LOCATION_MIN_DISTINCT + 2
+        else RiskLevel.MEDIUM
+    )
+
+    names = sorted(locations)
+    ids = sorted({i for group in locations.values() for i in group})
+
+    reason = (
+        f"Activity from {len(locations)} locations ({', '.join(names)}) within "
+        f"{LOCATION_WINDOW_HOURS}h. Only place names are recorded, so travel time "
+        f"cannot be verified - treat as unusual movement, not impossible travel."
+    )
+
+    return _RuleHit(
+        "LOCATION_ANOMALY", points, severity, reason, 0.20,
+        {
+            "distinct_locations": len(locations),
+            "locations": names,
+            "window_hours": LOCATION_WINDOW_HOURS,
+            "coordinates_available": False,
+        },
+        confidence=_confidence(len(locations), LOCATION_MIN_DISTINCT + 2),
+        transaction_ids=ids,
+    )
+
+
+def _rule_failed_burst(ctx: RiskContext) -> Optional[_RuleHit]:
+    """Clusters of failed or reversed attempts - probing or card testing."""
+    current = ctx.transaction
+    cur_ts = _naive(current.transaction_timestamp)
+    window_s = FAILED_WINDOW_HOURS * 3600
+
+    failed_ids = []
+    total = 1
+
+    if _is_failed(current):
+        failed_ids.append(current.transaction_id)
+
+    for t in ctx.recent_transactions:
+        if not _preceding(cur_ts, t, window_s):
+            continue
+        total += 1
+        if _is_failed(t):
+            failed_ids.append(t.transaction_id)
+
+    if len(failed_ids) < FAILED_MIN_COUNT:
+        return None
+
+    ratio = len(failed_ids) / float(total) if total else 0.0
+
+    points = min(
+        FAILED_MAX_POINTS,
+        FAILED_BASE_POINTS
+        + (len(failed_ids) - FAILED_MIN_COUNT) * FAILED_POINTS_PER_EXTRA,
+    )
+
+    severity = RiskLevel.MEDIUM if ratio >= 0.5 else RiskLevel.LOW
+
+    reason = (
+        f"{len(failed_ids)} of {total} transactions in the last "
+        f"{FAILED_WINDOW_HOURS}h failed or were reversed ({ratio * 100:.0f}%) - "
+        f"repeated failures can indicate probing for a working route."
+    )
+
+    return _RuleHit(
+        "FAILED_BURST", points, severity, reason, 0.15,
+        {
+            "failed_count": len(failed_ids),
+            "total_in_window": total,
+            "failure_ratio": round(ratio, 4),
+            "window_hours": FAILED_WINDOW_HOURS,
+        },
+        confidence=_confidence(len(failed_ids), FAILED_MIN_COUNT + 2),
+        transaction_ids=sorted(failed_ids),
+    )
+
+
+def _rule_circular_flow(ctx: RiskContext) -> Optional[_RuleHit]:
+    """
+    Money bouncing back and forth with the same counterparty. Only direct
+    round trips are visible here; longer cycles need the transaction graph.
+    """
+    account_id = ctx.account.account_id
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = CIRCULAR_WINDOW_HOURS * 3600
+
+    sent_to = {}
+    received_from = {}
+
+    legs = [ctx.transaction] + [
+        t for t in ctx.recent_transactions if _preceding(cur_ts, t, window_s)
+    ]
+
+    for t in legs:
+        if not _is_settled(t):
+            continue
+        if _is_outgoing(t, account_id) and t.receiver_account_id is not None:
+            sent_to.setdefault(t.receiver_account_id, []).append(t.transaction_id)
+        elif _is_incoming(t, account_id) and t.sender_account_id is not None:
+            received_from.setdefault(t.sender_account_id, []).append(t.transaction_id)
+
+    loops = sorted(set(sent_to) & set(received_from))
+
+    if not loops:
+        return None
+
+    ids = []
+    for counterparty in loops:
+        ids.extend(sent_to[counterparty])
+        ids.extend(received_from[counterparty])
+
+    ids = sorted(set(ids))
+
+    if len(ids) < CIRCULAR_MIN_LEGS:
+        return None
+
+    reason = (
+        f"Money moved in both directions with {len(loops)} counterparty account(s) "
+        f"({', '.join(map(str, loops))}) across {len(ids)} transactions in "
+        f"{CIRCULAR_WINDOW_HOURS}h - circular flow that does not resemble ordinary "
+        f"payment activity."
+    )
+
+    return _RuleHit(
+        "CIRCULAR_FLOW", CIRCULAR_POINTS, RiskLevel.HIGH, reason, 0.25,
+        {
+            "counterparty_account_ids": loops,
+            "leg_count": len(ids),
+            "window_hours": CIRCULAR_WINDOW_HOURS,
+            "direct_round_trips_only": True,
+        },
+        confidence=_confidence(len(ids), CIRCULAR_MIN_LEGS + 2),
+        transaction_ids=ids,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # The engine
 # --------------------------------------------------------------------------- #
- 
+
 _RULE_FUNCS = (
     _rule_large_transaction,
     _rule_new_device,
@@ -313,30 +1035,199 @@ _RULE_FUNCS = (
     _rule_high_velocity,
     _rule_structuring,
     _rule_new_account,
+    _rule_rapid_movement,
+    _rule_burst_activity,
+    _rule_fan_in,
+    _rule_fan_out,
+    _rule_pass_through,
+    _rule_dormant_activation,
+    _rule_device_reuse,
+    _rule_location_anomaly,
+    _rule_failed_burst,
+    _rule_circular_flow,
 )
- 
+
 _RULE_CODES = [
     "LARGE_TRANSACTION", "NEW_DEVICE", "NEW_LOCATION", "NEW_RECEIVER",
     "HIGH_VELOCITY", "STRUCTURING", "NEW_ACCOUNT",
+    "RAPID_MOVEMENT", "BURST_ACTIVITY", "FAN_IN", "FAN_OUT", "PASS_THROUGH",
+    "DORMANT_ACTIVATION", "DEVICE_REUSE", "LOCATION_ANOMALY", "FAILED_BURST",
+    "CIRCULAR_FLOW",
 ]
- 
- 
+
+# Rules in the same family read the same underlying evidence. Grouping them
+# is what stops one behaviour from being scored twice at full weight.
+_RULE_FAMILY = {
+    "LARGE_TRANSACTION": "amount",
+    "STRUCTURING": "structuring",
+    "HIGH_VELOCITY": "velocity",
+    "BURST_ACTIVITY": "velocity",
+    "RAPID_MOVEMENT": "flow",
+    "PASS_THROUGH": "flow",
+    "NEW_RECEIVER": "counterparty",
+    "FAN_IN": "counterparty",
+    "FAN_OUT": "counterparty",
+    "CIRCULAR_FLOW": "counterparty",
+    "NEW_DEVICE": "device",
+    "DEVICE_REUSE": "device",
+    "NEW_LOCATION": "location",
+    "LOCATION_ANOMALY": "location",
+    "NEW_ACCOUNT": "account_age",
+    "DORMANT_ACTIVATION": "account_age",
+    "FAILED_BURST": "transaction_quality",
+}
+
+_RULE_NAME = {
+    "LARGE_TRANSACTION": "Large transaction versus account baseline",
+    "NEW_DEVICE": "First-seen device",
+    "NEW_LOCATION": "First-seen location",
+    "NEW_RECEIVER": "First-time receiver",
+    "HIGH_VELOCITY": "High transaction velocity",
+    "STRUCTURING": "Possible structuring / threshold avoidance",
+    "NEW_ACCOUNT": "Newly opened account",
+    "RAPID_MOVEMENT": "Rapid movement of funds",
+    "BURST_ACTIVITY": "Burst of transactions",
+    "FAN_IN": "Many-to-one inflow concentration",
+    "FAN_OUT": "One-to-many outflow distribution",
+    "PASS_THROUGH": "Pass-through / transit account behaviour",
+    "DORMANT_ACTIVATION": "Dormant account reactivation",
+    "DEVICE_REUSE": "Device shared across accounts",
+    "LOCATION_ANOMALY": "Implausible location switching",
+    "FAILED_BURST": "Cluster of failed or reversed transactions",
+    "CIRCULAR_FLOW": "Circular / reciprocal fund flow",
+}
+
+# The seven original rules predate per-hit confidence; these are their
+# standing evidence-strength values.
+_RULE_BASE_CONFIDENCE = {
+    "LARGE_TRANSACTION": 0.70,
+    "NEW_DEVICE": 0.60,
+    "NEW_LOCATION": 0.50,
+    "NEW_RECEIVER": 0.40,
+    "HIGH_VELOCITY": 0.70,
+    "STRUCTURING": 0.75,
+    "NEW_ACCOUNT": 0.60,
+}
+
+_DEFAULT_CONFIDENCE = 0.50
+
+
+def _normalize_context(context: RiskContext) -> RiskContext:
+    """
+    Make the history safe to score: drop repeated rows and any copy of the
+    transaction under analysis, then order it deterministically. Without
+    this, a duplicated row would let one piece of evidence be counted twice.
+    """
+    seen = set()
+    unique = []
+
+    for t in context.recent_transactions:
+        if t.transaction_id == context.transaction.transaction_id:
+            continue
+        if t.transaction_id in seen:
+            continue
+        seen.add(t.transaction_id)
+        unique.append(t)
+
+    unique.sort(
+        key=lambda t: (_naive(t.transaction_timestamp), t.transaction_id),
+        reverse=True,
+    )
+
+    return context.model_copy(update={"recent_transactions": unique})
+
+
+def _aggregate_score(hits: list) -> tuple:
+    """
+    Combine rule points without double-counting.
+
+    Inside a family the strongest rule counts in full and the rest are
+    discounted, because they are re-reading the same evidence. Families are
+    independent signals, so they stack - but with a decay, so piling on weak
+    extra families cannot manufacture a CRITICAL on its own.
+    """
+    if not hits:
+        return 0.0, {}
+
+    by_family = {}
+
+    for h in hits:
+        family = _RULE_FAMILY.get(h.code, h.code.lower())
+        by_family.setdefault(family, []).append(h.points)
+
+    family_totals = {}
+
+    for family, points in by_family.items():
+        ordered = sorted(points, reverse=True)
+        family_totals[family] = round(
+            ordered[0] + FAMILY_WITHIN_DECAY * sum(ordered[1:]), 4
+        )
+
+    ranked = sorted(family_totals.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    total = 0.0
+    for index, (_family, points) in enumerate(ranked):
+        total += points * (FAMILY_ACROSS_DECAY ** index)
+
+    return min(100.0, total), family_totals
+
+
+def _combine_anomaly(values) -> float:
+    """
+    Noisy-OR: each signal removes part of the remaining "looks normal" mass.
+    Bounded at 1.0 by construction and independent of evaluation order.
+    """
+    remaining = 1.0
+    for value in values:
+        remaining *= 1.0 - max(0.0, min(1.0, value))
+    return 1.0 - remaining
+
+
+def _hit_confidence(hit: _RuleHit) -> float:
+    if hit.confidence is not None:
+        return hit.confidence
+    return _RULE_BASE_CONFIDENCE.get(hit.code, _DEFAULT_CONFIDENCE)
+
+
 class RuleBasedRiskEngine(RiskEngine):
     """Behavioral, explainable risk engine. No ML, no database."""
- 
+
     def analyze(self, context: RiskContext) -> RiskResult:
+        context = _normalize_context(context)
+
         hits = [hit for hit in (fn(context) for fn in _RULE_FUNCS) if hit is not None]
- 
-        # Additive scoring: signals combine. One moderate rule alone cannot
-        # reach CRITICAL — that requires enough points from multiple signals.
-        risk_score = min(100.0, sum(h.points for h in hits))
+
+        # Strongest first, ties broken on code, so identical input always
+        # produces identical output.
+        hits.sort(key=lambda h: (-h.points, h.code))
+
+        risk_score, family_totals = _aggregate_score(hits)
         risk_level = _level_from_score(risk_score)
         mule_probability = _logistic(risk_score)
-        anomaly_score = min(1.0, sum(h.anomaly for h in hits))
- 
+        anomaly_score = _combine_anomaly(h.anomaly for h in hits)
+
         triggered = [h.code for h in hits]
         reasons = [h.reason for h in hits]
- 
+
+        account_id = context.account.account_id
+        current_id = context.transaction.transaction_id
+
+        findings = [
+            {
+                "rule_id": h.code,
+                "rule_name": _RULE_NAME.get(h.code, h.code),
+                "family": _RULE_FAMILY.get(h.code, h.code.lower()),
+                "severity": h.severity.value,
+                "score_contribution": round(h.points, 2),
+                "confidence": round(_hit_confidence(h), 2),
+                "account_id": account_id,
+                "transaction_ids": h.transaction_ids or [current_id],
+                "explanation": h.reason,
+                "evidence": h.details,
+            }
+            for h in hits
+        ]
+
         explanation = {
             "engine": "rule_based",
             "reasons": reasons or ["No behavioral risk rules triggered."],
@@ -344,13 +1235,44 @@ class RuleBasedRiskEngine(RiskEngine):
             "triggered_rules": triggered,
             "signals": {h.code: h.details for h in hits},
             "score_breakdown": {h.code: round(h.points, 1) for h in hits},
+            "family_breakdown": family_totals,
+            "findings": findings,
+            "score_model": {
+                "method": "family-discounted additive",
+                # family_breakdown holds combined points per evidence family
+                # BEFORE the across-family decay and the 0-100 cap. Those
+                # values deliberately do not sum to risk_score.
+                "family_breakdown_is": (
+                    "combined points per evidence family, before the "
+                    "across-family decay and the 0-100 cap; these values "
+                    "do not sum to risk_score"
+                ),
+                "within_family_decay": FAMILY_WITHIN_DECAY,
+                "across_family_decay": FAMILY_ACROSS_DECAY,
+                "thresholds": {
+                    "medium": MEDIUM_MIN,
+                    "high": HIGH_MIN,
+                    "critical": CRITICAL_MIN,
+                },
+            },
         }
- 
+
         detected_patterns = [
-            DetectedPattern(code=h.code, description=h.reason, severity=h.severity)
+            DetectedPattern(
+                code=h.code,
+                rule_id=h.code,
+                rule_name=_RULE_NAME.get(h.code, h.code),
+                description=h.reason,
+                severity=h.severity,
+                score_contribution=round(h.points, 2),
+                confidence=round(_hit_confidence(h), 2),
+                account_id=account_id,
+                transaction_ids=h.transaction_ids or [current_id],
+                evidence=h.details,
+            )
             for h in hits
         ]
- 
+
         return RiskResult(
             anomaly_score=round(anomaly_score, 4),
             risk_score=round(risk_score, 2),
