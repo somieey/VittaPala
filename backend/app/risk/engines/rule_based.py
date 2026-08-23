@@ -15,7 +15,7 @@ from app.risk.contracts import (
     TransactionData,
 )
  
-MODEL_VERSION = "rule_based-0.3.0"
+MODEL_VERSION = "rule_based-0.4.0"
  
 # --------------------------------------------------------------------------- #
 # Tunable thresholds (kept from the design we agreed on earlier).
@@ -57,8 +57,8 @@ STRUCTURING_POINTS = 35.0
 # NEW_ACCOUNT
 NEW_ACCOUNT_RECENT_DAYS = 30
 NEW_ACCOUNT_VERY_RECENT_DAYS = 7
-NEW_ACCOUNT_POINTS_RECENT = 15.0
-NEW_ACCOUNT_POINTS_VERY_RECENT = 30.0
+NEW_ACCOUNT_POINTS_RECENT = 10.0
+NEW_ACCOUNT_POINTS_VERY_RECENT = 18.0
  
 # mule_probability = logistic(risk_score): a smooth 0..1 S-curve.
 MULE_MIDPOINT = 50.0
@@ -70,7 +70,7 @@ MULE_STEEPNESS = 0.08
 # --------------------------------------------------------------------------- #
 
 # RAPID_MOVEMENT - money in, money straight back out.
-RAPID_MOVEMENT_WINDOW_MIN = 60      # how long after an inflow still counts
+RAPID_MOVEMENT_WINDOW_MIN = 180     # how long after an inflow still counts
 RAPID_MOVEMENT_MIN_RATIO = 0.60     # outflow must move >=60% of the inflow
 RAPID_MOVEMENT_FAST_MIN = 10        # under this many minutes -> HIGH
 RAPID_MOVEMENT_BASE_POINTS = 18.0
@@ -86,8 +86,8 @@ BURST_MAX_POINTS = 38.0
 
 # FAN_IN / FAN_OUT - many-to-one and one-to-many counterparty spread.
 FAN_WINDOW_HOURS = 24
-FAN_IN_MIN_SENDERS = 5
-FAN_OUT_MIN_RECEIVERS = 5
+FAN_IN_MIN_SENDERS = 4
+FAN_OUT_MIN_RECEIVERS = 4
 FAN_BASE_POINTS = 24.0
 FAN_POINTS_PER_EXTRA = 4.0
 FAN_MAX_POINTS = 42.0
@@ -96,13 +96,13 @@ FAN_MAX_POINTS = 42.0
 PASS_THROUGH_WINDOW_HOURS = 24
 PASS_THROUGH_MIN_INFLOW = 10_000.0  # ignore trivial sums
 PASS_THROUGH_MIN_LEGS = 2
-PASS_THROUGH_MIN_RATIO = 0.80       # outflow/inflow band that reads as transit
+PASS_THROUGH_MIN_RATIO = 0.50       # forwarding half of what arrives is transit
 PASS_THROUGH_MAX_RATIO = 1.20
 PASS_THROUGH_POINTS = 30.0
 
 # DORMANT_ACTIVATION - long quiet spell, then sudden movement.
 DORMANT_MAX_PRIOR_TXNS = 2          # activity before the history window
-DORMANT_MIN_ACCOUNT_AGE_DAYS = 90   # a new account is NEW_ACCOUNT, not dormant
+DORMANT_MIN_ACCOUNT_AGE_DAYS = 30   # below this NEW_ACCOUNT already covers it
 DORMANT_MIN_AMOUNT = 25_000.0
 DORMANT_MIN_RECENT_COUNT = 5
 DORMANT_POINTS = 28.0
@@ -110,7 +110,7 @@ DORMANT_POINTS = 28.0
 # DEVICE_REUSE - a shared fingerprint is a signal, never proof by itself.
 DEVICE_REUSE_MIN_ACCOUNTS = 2
 DEVICE_REUSE_HIGH_ACCOUNTS = 4
-DEVICE_REUSE_BASE_POINTS = 16.0
+DEVICE_REUSE_BASE_POINTS = 10.0
 DEVICE_REUSE_POINTS_PER_EXTRA = 6.0
 DEVICE_REUSE_MAX_POINTS = 34.0
 
@@ -141,6 +141,77 @@ CIRCULAR_POINTS = 26.0
 
 FAMILY_WITHIN_DECAY = 0.35      # weight of the 2nd..nth rule inside a family
 FAMILY_ACROSS_DECAY = 0.90      # weight decay across independent families
+
+# --------------------------------------------------------------------------- #
+# Baseline robustness.
+#
+# The old baseline was the median of the recent window alone, which is exactly
+# the data an attacker controls: pre-load twenty transfers of 20,000 and a
+# genuine 50,000 movement becomes "2.5x normal" and scores nothing. The
+# baseline is now anchored to money moved 30-180 days ago as well, which
+# cannot be rewritten today.
+# --------------------------------------------------------------------------- #
+
+# History depth at which the baseline is trusted in full. A median over three
+# transactions is a guess, and the rule now says so instead of scoring 40.
+LARGE_TXN_BASELINE_FULL_HISTORY = 10
+LARGE_TXN_MIN_BASELINE_CONFIDENCE = 0.50
+
+# How much a thin baseline is allowed to discount the finding. At 0.70 a
+# minimum-confidence baseline still keeps 70% of the points: a 25x deviation
+# is worth reporting even when we have only four transactions to compare to.
+LARGE_TXN_CONFIDENCE_FLOOR = 0.70
+
+# Recurring payments (rent, fees, EMI) look large against a median dominated by
+# small everyday spend, but they are not anomalies - the account has moved this
+# amount before. Precedent damps the finding rather than suppressing it,
+# because a mule can repeat an amount too.
+LARGE_TXN_PRECEDENT_TOLERANCE = 0.25
+LARGE_TXN_PRECEDENT_DAMPENER = 0.40
+
+# VOLUME_SPIKE - cumulative throughput, so splitting one large movement into
+# several mid-sized legs no longer hides it.
+VOLUME_WINDOW_HOURS = 24
+VOLUME_MIN_LEGS = 2                 # a 2-leg spike is still a spike;
+                                    # a single leg is LARGE_TRANSACTION's job
+VOLUME_MIN_ABSOLUTE = 25_000.0      # ignore small accounts entirely
+VOLUME_RATIO_TRIGGER = 4.0          # x the account's normal daily throughput
+
+# If one transaction is most of the window's outflow, this is a single large
+# payment - LARGE_TRANSACTION's job. Without this guard the same event scores
+# twice, in two different families, and one legitimate payment reaches HIGH.
+VOLUME_MAX_SINGLE_SHARE = 0.80
+VOLUME_BASE_POINTS = 20.0
+VOLUME_POINTS_PER_RATIO = 2.0
+VOLUME_MAX_POINTS = 42.0
+VOLUME_FALLBACK_DAILY_LEGS = 2.0    # 'a normal day' when no older anchor exists
+
+# BASELINE_SHIFT - the account's normal transaction size has structurally
+# moved. Catches slow escalation and deliberate baseline priming alike.
+BASELINE_SHIFT_MIN_RECENT = 4
+BASELINE_SHIFT_RATIO = 3.0
+BASELINE_SHIFT_MIN_RECENT_MEDIAN = 3_000.0
+BASELINE_SHIFT_POINTS = 24.0
+
+# --------------------------------------------------------------------------- #
+# Behavioural evidence vs. context.
+#
+# What the money did is evidence. Who the account is - new, on a shared phone,
+# in a new city - is context: it makes real evidence worse but proves nothing
+# on its own. Scoring them as peers is what turned a legitimate new customer
+# paying rent into a CRITICAL alert.
+# --------------------------------------------------------------------------- #
+
+CONTEXT_FAMILIES = frozenset(
+    {"account_age", "device", "location", "counterparty_novelty"}
+)
+
+# Context with no behavioural evidence behind it can reach MEDIUM, never HIGH.
+CONTEXT_ONLY_CAP = 35.0
+
+# When behaviour IS abnormal, context amplifies it - but never dominates.
+CONTEXT_WEIGHT = 0.50
+CONTEXT_MAX_SHARE = 0.50
  
  
 # --------------------------------------------------------------------------- #
@@ -189,20 +260,81 @@ def _logistic(score: float) -> float:
 # Individual rules — each returns an _RuleHit or None
 # --------------------------------------------------------------------------- #
  
+def _baseline_confidence(history_count: int) -> float:
+    """
+    How much the account's own history can be trusted as a baseline.
+    Three transactions is a guess; ten is a habit.
+    """
+    if history_count >= LARGE_TXN_BASELINE_FULL_HISTORY:
+        return 1.0
+
+    span = max(1, LARGE_TXN_BASELINE_FULL_HISTORY - LARGE_TXN_MIN_HISTORY)
+    progress = (history_count - LARGE_TXN_MIN_HISTORY) / span
+
+    return round(
+        LARGE_TXN_MIN_BASELINE_CONFIDENCE
+        + (1.0 - LARGE_TXN_MIN_BASELINE_CONFIDENCE) * max(0.0, progress),
+        4,
+    )
+
+
+def _robust_baseline(ctx: RiskContext, amounts: list) -> tuple:
+    """
+    Baseline resistant to priming.
+
+    The recent median alone is attacker-controlled. Where the account has
+    pre-window history, the lower of (recent median, pre-window average) is
+    used: inflating recent activity no longer raises the bar, because the
+    older anchor stays put.
+
+    Returns (baseline, anchor_used, prior_average).
+    """
+    recent_median = max(median(amounts), 1.0)
+
+    prior_average = ctx.related_data.get("prior_activity_average")
+
+    if isinstance(prior_average, (int, float)) and prior_average > 0:
+        if prior_average < recent_median:
+            return max(float(prior_average), 1.0), "pre_window_average", float(
+                prior_average
+            )
+        return recent_median, "recent_median", float(prior_average)
+
+    return recent_median, "recent_median", None
+
+
+def _has_precedent(current: float, amounts: list) -> bool:
+    """True when this account has already moved a comparable amount."""
+    if current <= 0:
+        return False
+
+    low = current * (1.0 - LARGE_TXN_PRECEDENT_TOLERANCE)
+    high = current * (1.0 + LARGE_TXN_PRECEDENT_TOLERANCE)
+
+    return any(low <= amount <= high for amount in amounts)
+
+
 def _rule_large_transaction(ctx: RiskContext) -> Optional[_RuleHit]:
     current = _to_float(ctx.transaction.amount)
     amounts = [_to_float(t.amount) for t in ctx.recent_transactions]
- 
+
     if len(amounts) >= LARGE_TXN_MIN_HISTORY:
-        baseline = max(median(amounts), 1.0)
+        baseline, anchor, prior_average = _robust_baseline(ctx, amounts)
         ratio = current / baseline
         if ratio < LARGE_TXN_RATIO_TRIGGER:
             return None
+        confidence = _baseline_confidence(len(amounts))
         points = min(
             LARGE_TXN_MAX_POINTS,
             LARGE_TXN_BASE_POINTS
             + (ratio - LARGE_TXN_RATIO_TRIGGER) * LARGE_TXN_POINTS_PER_RATIO,
+        ) * (
+            LARGE_TXN_CONFIDENCE_FLOOR
+            + (1.0 - LARGE_TXN_CONFIDENCE_FLOOR) * confidence
         )
+        precedent = _has_precedent(current, amounts)
+        if precedent:
+            points *= LARGE_TXN_PRECEDENT_DAMPENER
         if ratio >= 10:
             severity = RiskLevel.HIGH
         elif ratio >= 5:
@@ -215,14 +347,24 @@ def _rule_large_transaction(ctx: RiskContext) -> Optional[_RuleHit]:
             f"spend (median \u20b9{baseline:,.0f} over the last {len(amounts)} "
             f"transactions)."
         )
+        if precedent:
+            reason += (
+                " The account has moved a comparable amount before, so this "
+                "is treated as a recurring payment rather than a new anomaly."
+            )
         return _RuleHit(
             "LARGE_TRANSACTION", points, severity, reason, anomaly,
             {
                 "current_amount": current,
                 "baseline_median": round(baseline, 2),
+                "baseline_anchor": anchor,
+                "pre_window_average": prior_average,
                 "ratio": round(ratio, 2),
                 "history_count": len(amounts),
+                "baseline_confidence": confidence,
+                "has_precedent": precedent,
             },
+            confidence=confidence,
         )
  
     # No usable history -> fall back to an absolute sanity threshold.
@@ -712,10 +854,17 @@ def _rule_pass_through(ctx: RiskContext) -> Optional[_RuleHit]:
 
     ratio = outflow_total / inflow_total
 
-    if not (PASS_THROUGH_MIN_RATIO <= ratio <= PASS_THROUGH_MAX_RATIO):
+    if ratio < PASS_THROUGH_MIN_RATIO or ratio > PASS_THROUGH_MAX_RATIO:
         return None
 
     retained = inflow_total - outflow_total
+
+    # Forwarding 95% is more transit-like than forwarding 55%; score it that
+    # way rather than treating everything inside the band identically.
+    forwarded_strength = min(1.0, ratio / PASS_THROUGH_MAX_RATIO)
+    graded_points = PASS_THROUGH_POINTS * (0.6 + 0.4 * forwarded_strength)
+
+    severity = RiskLevel.HIGH if ratio >= 0.80 else RiskLevel.MEDIUM
 
     reason = (
         f"₹{inflow_total:,.0f} in and ₹{outflow_total:,.0f} out over "
@@ -725,7 +874,7 @@ def _rule_pass_through(ctx: RiskContext) -> Optional[_RuleHit]:
     )
 
     return _RuleHit(
-        "PASS_THROUGH", PASS_THROUGH_POINTS, RiskLevel.HIGH, reason, 0.30,
+        "PASS_THROUGH", graded_points, severity, reason, 0.30,
         {
             "inflow_total": round(inflow_total, 2),
             "outflow_total": round(outflow_total, 2),
@@ -831,11 +980,13 @@ def _rule_device_reuse(ctx: RiskContext) -> Optional[_RuleHit]:
         * DEVICE_REUSE_POINTS_PER_EXTRA,
     )
 
-    severity = (
-        RiskLevel.HIGH
-        if len(account_ids) >= DEVICE_REUSE_HIGH_ACCOUNTS
-        else RiskLevel.MEDIUM
-    )
+    if len(account_ids) >= DEVICE_REUSE_HIGH_ACCOUNTS:
+        severity = RiskLevel.HIGH
+    elif len(account_ids) > DEVICE_REUSE_MIN_ACCOUNTS:
+        severity = RiskLevel.MEDIUM
+    else:
+        # Exactly two accounts on one handset is overwhelmingly a household.
+        severity = RiskLevel.LOW
 
     lookback = ctx.related_data.get("device_lookback_days", "?")
 
@@ -1023,6 +1174,165 @@ def _rule_circular_flow(ctx: RiskContext) -> Optional[_RuleHit]:
     )
 
 
+def _rule_volume_spike(ctx: RiskContext) -> Optional[_RuleHit]:
+    """
+    Cumulative outflow over a day, judged against what this account normally
+    moves in a day.
+
+    This is the anti-splitting rule. LARGE_TRANSACTION only ever sees one leg,
+    so five transfers of 10,000 slip past it while 50,000 in one go does not.
+    Throughput does not care how the total was chopped up.
+    """
+    account_id = ctx.account.account_id
+    cur_ts = _naive(ctx.transaction.transaction_timestamp)
+    window_s = VOLUME_WINDOW_HOURS * 3600
+
+    legs = [ctx.transaction] + [
+        t for t in ctx.recent_transactions if _preceding(cur_ts, t, window_s)
+    ]
+
+    outgoing = [
+        t for t in legs
+        if _is_outgoing(t, account_id) and _is_settled(t)
+    ]
+
+    if len(outgoing) < VOLUME_MIN_LEGS:
+        return None
+
+    total = sum(_to_float(t.amount) for t in outgoing)
+
+    if total < VOLUME_MIN_ABSOLUTE:
+        return None
+
+    # This rule is about accumulation across legs. When a single transfer
+    # dominates the window there is no accumulation to report.
+    largest_leg = max(_to_float(t.amount) for t in outgoing)
+
+    if total > 0 and (largest_leg / total) > VOLUME_MAX_SINGLE_SHARE:
+        return None
+
+    # Preferred anchor: money moved 30-180 days ago, which today's activity
+    # cannot rewrite. Fallback: the recent median, used only when the account
+    # has no pre-window history at all (a genuinely young account has little
+    # for an attacker to prime).
+    prior_total = ctx.related_data.get("prior_activity_total")
+    prior_days = ctx.related_data.get("prior_activity_days")
+
+    if (
+        isinstance(prior_total, (int, float))
+        and prior_total > 0
+        and isinstance(prior_days, (int, float))
+        and prior_days > 0
+    ):
+        baseline_daily = max(float(prior_total) / float(prior_days), 1.0)
+        anchor = "pre_window_daily_average"
+    else:
+        amounts = [_to_float(t.amount) for t in ctx.recent_transactions]
+        if not amounts:
+            return None
+        baseline_daily = max(
+            median(amounts) * VOLUME_FALLBACK_DAILY_LEGS, 1.0
+        )
+        anchor = "recent_median_fallback"
+
+    ratio = total / baseline_daily
+
+    if ratio < VOLUME_RATIO_TRIGGER:
+        return None
+
+    points = min(
+        VOLUME_MAX_POINTS,
+        VOLUME_BASE_POINTS
+        + (ratio - VOLUME_RATIO_TRIGGER) * VOLUME_POINTS_PER_RATIO,
+    )
+
+    severity = (
+        RiskLevel.HIGH
+        if ratio >= VOLUME_RATIO_TRIGGER * 3
+        else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"\u20b9{total:,.0f} left the account across {len(outgoing)} transfers in "
+        f"{VOLUME_WINDOW_HOURS}h - {ratio:.1f}x its normal daily throughput of "
+        f"\u20b9{baseline_daily:,.0f}. Splitting a large movement into smaller "
+        f"legs does not change the total."
+    )
+
+    return _RuleHit(
+        "VOLUME_SPIKE", points, severity, reason, 0.30,
+        {
+            "window_outflow": round(total, 2),
+            "leg_count": len(outgoing),
+            "baseline_daily": round(baseline_daily, 2),
+            "baseline_anchor": anchor,
+            "ratio": round(ratio, 2),
+            "largest_leg": round(largest_leg, 2),
+            "largest_leg_share": round(largest_leg / total, 4),
+            "window_hours": VOLUME_WINDOW_HOURS,
+        },
+        confidence=_confidence(len(outgoing), VOLUME_MIN_LEGS + 3),
+        transaction_ids=sorted(t.transaction_id for t in outgoing),
+    )
+
+
+def _rule_baseline_shift(ctx: RiskContext) -> Optional[_RuleHit]:
+    """
+    The account's normal transaction size has structurally moved upward.
+
+    Catches both slow escalation (1k -> 2k -> 5k -> 15k -> 30k, where no single
+    step is anomalous against the step before it) and deliberate priming, where
+    an attacker runs transfers purely to raise the median before the real
+    movement. Both look identical from inside the recent window; both stand out
+    against what the account did months ago.
+    """
+    amounts = [_to_float(t.amount) for t in ctx.recent_transactions]
+
+    if len(amounts) < BASELINE_SHIFT_MIN_RECENT:
+        return None
+
+    prior_average = ctx.related_data.get("prior_activity_average")
+
+    # Without a pre-window anchor there is nothing to have shifted from.
+    if not isinstance(prior_average, (int, float)) or prior_average <= 0:
+        return None
+
+    recent_median = median(amounts)
+
+    # Small accounts drift for boring reasons; only judge meaningful sums.
+    if recent_median < BASELINE_SHIFT_MIN_RECENT_MEDIAN:
+        return None
+
+    ratio = recent_median / float(prior_average)
+
+    if ratio < BASELINE_SHIFT_RATIO:
+        return None
+
+    points = BASELINE_SHIFT_POINTS
+
+    severity = (
+        RiskLevel.HIGH if ratio >= BASELINE_SHIFT_RATIO * 2 else RiskLevel.MEDIUM
+    )
+
+    reason = (
+        f"This account's typical transfer has moved from \u20b9{prior_average:,.0f} "
+        f"to \u20b9{recent_median:,.0f} ({ratio:.1f}x) compared with its own earlier "
+        f"history - the behaviour itself changed, not just one transaction."
+    )
+
+    return _RuleHit(
+        "BASELINE_SHIFT", points, severity, reason, 0.25,
+        {
+            "recent_median": round(recent_median, 2),
+            "pre_window_average": round(float(prior_average), 2),
+            "ratio": round(ratio, 2),
+            "recent_count": len(amounts),
+        },
+        confidence=_confidence(len(amounts), BASELINE_SHIFT_MIN_RECENT + 4),
+        transaction_ids=sorted(t.transaction_id for t in ctx.recent_transactions)[:10],
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The engine
 # --------------------------------------------------------------------------- #
@@ -1045,6 +1355,8 @@ _RULE_FUNCS = (
     _rule_location_anomaly,
     _rule_failed_burst,
     _rule_circular_flow,
+    _rule_volume_spike,
+    _rule_baseline_shift,
 )
 
 _RULE_CODES = [
@@ -1052,7 +1364,7 @@ _RULE_CODES = [
     "HIGH_VELOCITY", "STRUCTURING", "NEW_ACCOUNT",
     "RAPID_MOVEMENT", "BURST_ACTIVITY", "FAN_IN", "FAN_OUT", "PASS_THROUGH",
     "DORMANT_ACTIVATION", "DEVICE_REUSE", "LOCATION_ANOMALY", "FAILED_BURST",
-    "CIRCULAR_FLOW",
+    "CIRCULAR_FLOW", "VOLUME_SPIKE", "BASELINE_SHIFT",
 ]
 
 # Rules in the same family read the same underlying evidence. Grouping them
@@ -1064,7 +1376,7 @@ _RULE_FAMILY = {
     "BURST_ACTIVITY": "velocity",
     "RAPID_MOVEMENT": "flow",
     "PASS_THROUGH": "flow",
-    "NEW_RECEIVER": "counterparty",
+    "NEW_RECEIVER": "counterparty_novelty",
     "FAN_IN": "counterparty",
     "FAN_OUT": "counterparty",
     "CIRCULAR_FLOW": "counterparty",
@@ -1073,8 +1385,10 @@ _RULE_FAMILY = {
     "NEW_LOCATION": "location",
     "LOCATION_ANOMALY": "location",
     "NEW_ACCOUNT": "account_age",
-    "DORMANT_ACTIVATION": "account_age",
+    "DORMANT_ACTIVATION": "dormancy",
     "FAILED_BURST": "transaction_quality",
+    "VOLUME_SPIKE": "volume",
+    "BASELINE_SHIFT": "drift",
 }
 
 _RULE_NAME = {
@@ -1095,6 +1409,8 @@ _RULE_NAME = {
     "LOCATION_ANOMALY": "Implausible location switching",
     "FAILED_BURST": "Cluster of failed or reversed transactions",
     "CIRCULAR_FLOW": "Circular / reciprocal fund flow",
+    "VOLUME_SPIKE": "Cumulative outflow spike",
+    "BASELINE_SHIFT": "Structural change in spending baseline",
 }
 
 # The seven original rules predate per-hit confidence; these are their
@@ -1137,17 +1453,37 @@ def _normalize_context(context: RiskContext) -> RiskContext:
     return context.model_copy(update={"recent_transactions": unique})
 
 
+def _decayed_total(family_totals: dict) -> float:
+    """Independent families stack, strongest first, with a decay per rank."""
+    ranked = sorted(family_totals.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    total = 0.0
+    for index, (_family, points) in enumerate(ranked):
+        total += points * (FAMILY_ACROSS_DECAY ** index)
+
+    return total
+
+
 def _aggregate_score(hits: list) -> tuple:
     """
-    Combine rule points without double-counting.
+    Combine rule points without double-counting, and without letting context
+    masquerade as evidence.
 
-    Inside a family the strongest rule counts in full and the rest are
-    discounted, because they are re-reading the same evidence. Families are
-    independent signals, so they stack - but with a decay, so piling on weak
-    extra families cannot manufacture a CRITICAL on its own.
+    Three layers:
+
+    1. Within a family the strongest rule counts in full and the rest are
+       discounted - they are re-reading the same evidence.
+    2. Families stack with a rank decay, so piling on weak extra families
+       cannot manufacture a CRITICAL.
+    3. Behavioural families (what the money did) carry the score. Context
+       families (new account, shared device, new city) only amplify real
+       behavioural evidence, and on their own are capped below HIGH.
+
+    Layer 3 is what stops a legitimate new customer on a family phone from
+    being scored the same as a mule.
     """
     if not hits:
-        return 0.0, {}
+        return 0.0, {}, {}
 
     by_family = {}
 
@@ -1163,13 +1499,43 @@ def _aggregate_score(hits: list) -> tuple:
             ordered[0] + FAMILY_WITHIN_DECAY * sum(ordered[1:]), 4
         )
 
-    ranked = sorted(family_totals.items(), key=lambda kv: (-kv[1], kv[0]))
+    behavioural_families = {
+        f: v for f, v in family_totals.items() if f not in CONTEXT_FAMILIES
+    }
+    context_families = {
+        f: v for f, v in family_totals.items() if f in CONTEXT_FAMILIES
+    }
 
-    total = 0.0
-    for index, (_family, points) in enumerate(ranked):
-        total += points * (FAMILY_ACROSS_DECAY ** index)
+    behavioural_total = _decayed_total(behavioural_families)
+    context_total = _decayed_total(context_families)
 
-    return min(100.0, total), family_totals
+    if behavioural_total <= 0.0:
+        # Nothing abnormal happened with the money. Context alone is a reason
+        # to look, never a reason to call it high risk.
+        context_applied = min(CONTEXT_ONLY_CAP, context_total)
+        score = context_applied
+        capped = context_total > CONTEXT_ONLY_CAP
+    else:
+        context_applied = min(
+            context_total * CONTEXT_WEIGHT,
+            behavioural_total * CONTEXT_MAX_SHARE,
+        )
+        score = behavioural_total + context_applied
+        capped = (
+            context_total * CONTEXT_WEIGHT
+            > behavioural_total * CONTEXT_MAX_SHARE
+        )
+
+    tiers = {
+        "behavioural_total": round(behavioural_total, 2),
+        "context_total": round(context_total, 2),
+        "context_applied": round(context_applied, 2),
+        "context_capped": capped,
+        "behavioural_families": sorted(behavioural_families),
+        "context_families": sorted(context_families),
+    }
+
+    return min(100.0, score), family_totals, tiers
 
 
 def _combine_anomaly(values) -> float:
@@ -1201,7 +1567,7 @@ class RuleBasedRiskEngine(RiskEngine):
         # produces identical output.
         hits.sort(key=lambda h: (-h.points, h.code))
 
-        risk_score, family_totals = _aggregate_score(hits)
+        risk_score, family_totals, tiers = _aggregate_score(hits)
         risk_level = _level_from_score(risk_score)
         mule_probability = _logistic(risk_score)
         anomaly_score = _combine_anomaly(h.anomaly for h in hits)
@@ -1236,9 +1602,17 @@ class RuleBasedRiskEngine(RiskEngine):
             "signals": {h.code: h.details for h in hits},
             "score_breakdown": {h.code: round(h.points, 1) for h in hits},
             "family_breakdown": family_totals,
+            "tier_breakdown": tiers,
             "findings": findings,
             "score_model": {
-                "method": "family-discounted additive",
+                "method": "two-tier family-discounted additive",
+                "tiers": (
+                    "behavioural evidence carries the score; context "
+                    "(new account, shared device, new location) amplifies it "
+                    "but is capped at %.0f on its own"
+                ) % CONTEXT_ONLY_CAP,
+                "context_weight": CONTEXT_WEIGHT,
+                "context_max_share": CONTEXT_MAX_SHARE,
                 # family_breakdown holds combined points per evidence family
                 # BEFORE the across-family decay and the 0-100 cap. Those
                 # values deliberately do not sum to risk_score.

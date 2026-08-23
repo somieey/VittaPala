@@ -1,159 +1,131 @@
-from fastapi import APIRouter, Depends, HTTPException
+"""Account management endpoints."""
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Account, RiskScore, FraudAlert, Transaction
+from ..models import Account, FraudAlert, Transaction
 from ..schemas.accounts import AccountCreate, AccountResponse
+from ..schemas.alerts import FraudAlertResponse
+from ..schemas.transactions import TransactionResponse
+from ..services.investigation import build_investigation
+
+router = APIRouter(prefix="/api/accounts", tags=["Accounts"])
 
 
-router = APIRouter(
-    prefix="/api/accounts",
-    tags=["Accounts"]
-)
-
-
-@router.post("/", response_model=AccountResponse)
-def create_account(
-    account: AccountCreate,
-    db: Session = Depends(get_db)
-):
-    new_account = Account(
-        account_number=account.account_number,
-        account_holder_name=account.account_holder_name,
-        account_type=account.account_type,
-        ifsc_code=account.ifsc_code,
-        bank_name=account.bank_name,
-        current_balance=account.current_balance,
-        kyc_verified=account.kyc_verified,
-        status=account.status,
-        date_opened=account.date_opened,
-    )
-
-    db.add(new_account)
-    db.commit()
-    db.refresh(new_account)
-
-    return new_account
-
-
-@router.get("/{account_id}", response_model=AccountResponse)
-def get_account(
-    account_id: int,
-    db: Session = Depends(get_db)
-):
+def _get_account_or_404(db: Session, account_id: int) -> Account:
     account = (
-        db.query(Account)
-        .filter(Account.account_id == account_id)
-        .first()
+        db.query(Account).filter(Account.account_id == account_id).first()
     )
 
-    if not account:
-        raise HTTPException(
-            status_code=404,
-            detail="Account not found"
-        )
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
 
     return account
 
 
-@router.get("/{account_id}/investigation")
-def get_account_investigation(
-    account_id: int,
-    db: Session = Depends(get_db),
-):
-    account = (
+@router.post("/", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
+def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
+    """Create a bank account."""
+    duplicate = (
         db.query(Account)
-        .filter(Account.account_id == account_id)
+        .filter(Account.account_number == payload.account_number)
         .first()
     )
 
-    if not account:
+    if duplicate is not None:
         raise HTTPException(
-            status_code=404,
-            detail="Account not found",
+            status_code=409,
+            detail="An account with this account_number already exists",
         )
 
-    risk_score = (
-        db.query(RiskScore)
-        .filter(RiskScore.account_id == account_id)
-        .order_by(RiskScore.scored_at.desc())
-        .first()
+    account = Account(**payload.model_dump())
+
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+
+    return account
+
+
+@router.get("/", response_model=list[AccountResponse])
+def list_accounts(
+    db: Session = Depends(get_db),
+    q: Optional[str] = Query(None, description="Search number or holder name"),
+    account_status: Optional[str] = Query(None, alias="status"),
+    kyc_verified: Optional[bool] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List accounts, newest first, with optional search and filters."""
+    query = db.query(Account)
+
+    if q:
+        pattern = f"%{q}%"
+        query = query.filter(
+            Account.account_number.like(pattern)
+            | Account.account_holder_name.like(pattern)
+        )
+
+    if account_status:
+        query = query.filter(Account.status == account_status)
+
+    if kyc_verified is not None:
+        query = query.filter(Account.kyc_verified.is_(kyc_verified))
+
+    return (
+        query.order_by(Account.account_id.desc()).offset(offset).limit(limit).all()
     )
 
-    alerts = (
-        db.query(FraudAlert)
-        .filter(FraudAlert.account_id == account_id)
-        .order_by(FraudAlert.created_at.desc())
-        .all()
-    )
 
-    transactions = (
+@router.get("/{account_id}", response_model=AccountResponse)
+def get_account(account_id: int, db: Session = Depends(get_db)):
+    return _get_account_or_404(db, account_id)
+
+
+@router.get("/{account_id}/transactions", response_model=list[TransactionResponse])
+def get_account_transactions(
+    account_id: int,
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Transaction history for one account, in either direction."""
+    _get_account_or_404(db, account_id)
+
+    return (
         db.query(Transaction)
         .filter(
             (Transaction.sender_account_id == account_id)
             | (Transaction.receiver_account_id == account_id)
         )
         .order_by(Transaction.transaction_timestamp.desc())
-        .limit(20)
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
-    return {
-        "account": {
-            "account_id": account.account_id,
-            "account_number": account.account_number,
-            "account_holder_name": account.account_holder_name,
-            "account_type": account.account_type,
-            "bank_name": account.bank_name,
-            "current_balance": float(account.current_balance),
-            "kyc_verified": account.kyc_verified,
-            "status": account.status,
-            "date_opened": account.date_opened,
-        },
 
-        "risk_score": (
-            {
-                "risk_score_id": risk_score.risk_score_id,
-                "risk_score": float(risk_score.risk_score),
-                "mule_probability": float(risk_score.mule_probability),
-                "risk_level": risk_score.risk_level,
-                "model_version": risk_score.model_version,
-                "explanation": risk_score.explanation,
-                "scored_at": risk_score.scored_at,
-            }
-            if risk_score
-            else None
-        ),
+@router.get("/{account_id}/alerts", response_model=list[FraudAlertResponse])
+def get_account_alerts(account_id: int, db: Session = Depends(get_db)):
+    """Every alert raised against one account."""
+    _get_account_or_404(db, account_id)
 
-        "alerts": [
-            {
-                "alert_id": alert.alert_id,
-                "transaction_id": alert.transaction_id,
-                "risk_score_id": alert.risk_score_id,
-                "alert_type": alert.alert_type,
-                "severity": alert.severity,
-                "status": alert.status,
-                "reason": alert.reason,
-                "created_at": alert.created_at,
-            }
-            for alert in alerts
-        ],
+    return (
+        db.query(FraudAlert)
+        .filter(FraudAlert.account_id == account_id)
+        .order_by(FraudAlert.created_at.desc())
+        .all()
+    )
 
-        "transactions": [
-            {
-                "transaction_id": transaction.transaction_id,
-                "amount": float(transaction.amount),
-                "currency": transaction.currency,
-                "transaction_type": transaction.transaction_type,
-                "channel": transaction.channel,
-                "status": transaction.status,
-                "transaction_timestamp": transaction.transaction_timestamp,
-                "description": transaction.description,
-                "sender_account_id": transaction.sender_account_id,
-                "receiver_account_id": transaction.receiver_account_id,
-                "location": transaction.location,
-                "device_id": transaction.device_id,
-            }
-            for transaction in transactions
-        ],
-    }
+
+@router.get("/{account_id}/investigation")
+def get_account_investigation(account_id: int, db: Session = Depends(get_db)):
+    """
+    Full investigation view: account, statistics, risk history, alerts,
+    devices, locations, counterparties, mule indicators and a summary.
+    """
+    account = _get_account_or_404(db, account_id)
+
+    return build_investigation(db, account)

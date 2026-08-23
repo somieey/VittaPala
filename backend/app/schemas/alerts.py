@@ -1,6 +1,26 @@
+"""Fraud alert request/response models."""
 from datetime import datetime
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+AlertType = Literal[
+    "mule_account",
+    "anomalous_transaction",
+    "structuring",
+    "rapid_movement",
+    "network_pattern",
+]
+AlertSeverity = Literal["low", "medium", "high", "critical"]
+
+# Matches alert_status_enum in models.py.
+AlertStatus = Literal[
+    "open",
+    "investigating",
+    "confirmed_fraud",
+    "false_positive",
+    "resolved",
+]
 
 
 class FraudAlertResponse(BaseModel):
@@ -8,14 +28,21 @@ class FraudAlertResponse(BaseModel):
 
     alert_id: int
     account_id: int
-    transaction_id: int | None
-    risk_score_id: int | None
+    transaction_id: Optional[int]
+    risk_score_id: Optional[int]
 
     alert_type: str
     severity: str
     status: str
 
-    reason: str | None
+    reason: Optional[str]
 
     created_at: datetime
-    resolved_at: datetime | None
+    resolved_at: Optional[datetime]
+
+
+class AlertStatusUpdate(BaseModel):
+    """Move an alert through its lifecycle."""
+
+    status: AlertStatus
+    note: Optional[str] = Field(default=None, max_length=255)

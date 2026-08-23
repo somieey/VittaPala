@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import Transaction, Account
@@ -245,8 +246,15 @@ def build_risk_context(
         - timedelta(days=PRIOR_ACTIVITY_DAYS)
     )
 
-    prior_activity_count = (
-        db.query(Transaction.transaction_id)
+    # Count AND value. The value is what makes the baseline hard to game: a
+    # median taken only from the recent window is whatever the account most
+    # recently did, so an attacker can raise it on demand. Money moved 30-180
+    # days ago cannot be rewritten today.
+    prior_aggregate = (
+        db.query(
+            func.count(Transaction.transaction_id),
+            func.coalesce(func.sum(Transaction.amount), 0),
+        )
         .filter(
             (
                 (Transaction.sender_account_id == account_id)
@@ -256,7 +264,18 @@ def build_risk_context(
             Transaction.transaction_timestamp >= prior_window_start,
             Transaction.transaction_timestamp < history_start,
         )
-        .count()
+        .one()
+    )
+
+    prior_activity_count = int(prior_aggregate[0] or 0)
+    prior_activity_total = float(prior_aggregate[1] or 0.0)
+
+    # Mean transaction size across the settled past, or None when the account
+    # has no pre-window history to anchor against.
+    prior_activity_average = (
+        round(prior_activity_total / prior_activity_count, 2)
+        if prior_activity_count > 0
+        else None
     )
 
     # Gap between this transaction and the account's previous activity.
@@ -324,6 +343,8 @@ def build_risk_context(
 
         # Dormancy.
         "prior_activity_count": prior_activity_count,
+        "prior_activity_total": prior_activity_total,
+        "prior_activity_average": prior_activity_average,
         "prior_activity_days": PRIOR_ACTIVITY_DAYS,
         "days_since_previous_activity": days_since_previous_activity,
     }

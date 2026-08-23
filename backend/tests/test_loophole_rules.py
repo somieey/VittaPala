@@ -7,7 +7,7 @@ from app.risk.contracts import (
     RiskLevel,
     TransactionData,
 )
-from app.risk.engines.rule_based import RuleBasedRiskEngine
+from app.risk.engines.rule_based import RuleBasedRiskEngine, _RULE_CODES
 
 
 # The account under analysis in every scenario below.
@@ -732,4 +732,7 @@ def test_quiet_account_explains_why_nothing_fired():
         "No behavioral risk rules triggered."
     ]
     assert result.explanation["triggered_rules"] == []
-    assert len(result.explanation["rules_evaluated"]) == 17
+    # Tied to the registry, not a magic number, so adding a rule does not
+    # require editing an unrelated assertion.
+    assert result.explanation["rules_evaluated"] == _RULE_CODES
+    assert len(result.explanation["rules_evaluated"]) >= 17
