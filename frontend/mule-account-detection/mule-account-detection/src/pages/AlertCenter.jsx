@@ -1,68 +1,52 @@
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import MainLayout from "../components/layout/mainlayout";
+import { getAlerts, updateAlertStatus } from "../services/api";
 
-const alerts = [
-  {
-    id: "ALT-10482",
-    severity: "CRITICAL",
-    title: "Possible Mule Account Detected",
-    account: "ACC-10234",
-    description:
-      "Account shows rapid movement of recently received funds across multiple high-risk counterparties.",
-    time: "2 min ago",
-    amount: "₹9.3L",
-    status: "OPEN",
-    type: "MULE",
-  },
-  {
-    id: "ALT-10481",
-    severity: "HIGH",
-    title: "Unusual Transaction Velocity",
-    account: "ACC-78124",
-    description:
-      "Transaction frequency is significantly above the account's historical behavioural baseline.",
-    time: "14 min ago",
-    amount: "₹4.8L",
-    status: "OPEN",
-    type: "VELOCITY",
-  },
-  {
-    id: "ALT-10480",
-    severity: "HIGH",
-    title: "High-Risk Network Connection",
-    account: "ACC-92817",
-    description:
-      "Account is connected to multiple entities with elevated fraud risk scores.",
-    time: "31 min ago",
-    amount: "₹4.5L",
-    status: "INVESTIGATING",
-    type: "NETWORK",
-  },
-  {
-    id: "ALT-10479",
-    severity: "MEDIUM",
-    title: "New Counterparty Pattern",
-    account: "ACC-44291",
-    description:
-      "Multiple transactions were initiated with previously unseen counterparties.",
-    time: "52 min ago",
-    amount: "₹2.25L",
-    status: "OPEN",
-    type: "COUNTERPARTY",
-  },
-  {
-    id: "ALT-10478",
-    severity: "MEDIUM",
-    title: "Amount Deviation Detected",
-    account: "ACC-67102",
-    description:
-      "Transaction amounts differ significantly from the account's normal activity.",
-    time: "1 hr ago",
-    amount: "₹2.1L",
-    status: "REVIEWED",
-    type: "ANOMALY",
-  },
-];
+
+// Backend alert_type -> the human title this screen already renders.
+const ALERT_TITLES = {
+  mule_account: "Possible Mule Account Detected",
+  anomalous_transaction: "Anomalous Transaction",
+  structuring: "Possible Structuring / Split Transfers",
+  rapid_movement: "Rapid Movement of Funds",
+  network_pattern: "High-Risk Network Connection",
+};
+
+const relativeTime = (iso) => {
+  if (!iso) return "unknown";
+
+  const then = new Date(iso).getTime();
+
+  if (Number.isNaN(then)) return "unknown";
+
+  const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+
+  return `${Math.floor(seconds / 86400)}d ago`;
+};
+
+/**
+ * Map an API alert onto the shape this screen was written against, so the
+ * existing layout keeps working while the data becomes real.
+ */
+const adaptAlert = (alert) => ({
+  id: `ALT-${alert.alert_id}`,
+  alertId: alert.alert_id,
+  severity: String(alert.severity || "low").toUpperCase(),
+  title: ALERT_TITLES[alert.alert_type] || "Fraud Alert",
+  account: `Account #${alert.account_id}`,
+  accountId: alert.account_id,
+  description: alert.reason || "No explanation was recorded for this alert.",
+  time: relativeTime(alert.created_at),
+  reference:
+    alert.transaction_id != null ? `Txn #${alert.transaction_id}` : "Account-level",
+  status: String(alert.status || "open").toUpperCase(),
+  type: String(alert.alert_type || "").toUpperCase(),
+});
+
 
 const severityStyles = {
   CRITICAL: {
@@ -96,6 +80,50 @@ function AlertCenter({ onNavigate }) {
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [selectedAlert, setSelectedAlert] = useState(null);
 
+  const [alerts, setAlerts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [updatingId, setUpdatingId] = useState(null);
+
+  const loadAlerts = useCallback(async () => {
+    setLoading(true);
+    setError("");
+
+    try {
+      const data = await getAlerts();
+
+      setAlerts(Array.isArray(data) ? data.map(adaptAlert) : []);
+    } catch (err) {
+      console.error("Alert loading error:", err);
+      setError(err.message || "Unable to load alerts.");
+      setAlerts([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadAlerts();
+  }, [loadAlerts]);
+
+  const handleStatusChange = useCallback(
+    async (alert, nextStatus) => {
+      setUpdatingId(alert.alertId);
+
+      try {
+        await updateAlertStatus(alert.alertId, nextStatus);
+        await loadAlerts();
+        setSelectedAlert(null);
+      } catch (err) {
+        console.error("Alert status update failed:", err);
+        setError(err.message || "Unable to update the alert.");
+      } finally {
+        setUpdatingId(null);
+      }
+    },
+    [loadAlerts]
+  );
+
   const filteredAlerts = useMemo(() => {
     return alerts.filter((alert) => {
       const severityMatch =
@@ -108,7 +136,7 @@ function AlertCenter({ onNavigate }) {
 
       return severityMatch && statusMatch;
     });
-  }, [severityFilter, statusFilter]);
+  }, [alerts, severityFilter, statusFilter]);
 
   const criticalCount = alerts.filter(
     (alert) => alert.severity === "CRITICAL"
@@ -126,13 +154,14 @@ function AlertCenter({ onNavigate }) {
     <MainLayout
       activePage="Alert Center"
       title="Alert Center"
-      subtitle="Monitor and investigate AI-generated fraud and mule-account alerts"
+      subtitle="Monitor and investigate fraud and mule-account alerts raised by the detection engine"
       onNavigate={onNavigate}
     >
-      {/* Page Header */}
-      <div className="border-b border-slate-800 bg-[#0B111B]">
-        <div className="mx-auto max-w-[1500px] px-5 py-5 lg:px-7">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+      <div className="space-y-6">
+        {/* Toolbar */}
+        <div className="rounded-2xl border border-slate-800 bg-[#0B111B]">
+        <div className="mx-auto max-w-[1500px] px-5 py-3 lg:px-7">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <div className="flex items-center gap-2">
                 <span className="h-2 w-2 rounded-full bg-red-400 shadow-[0_0_10px_rgba(248,113,113,0.6)]" />
@@ -142,14 +171,6 @@ function AlertCenter({ onNavigate }) {
                 </span>
               </div>
 
-              <h1 className="mt-2 text-xl font-semibold tracking-tight text-white">
-                Alert Center
-              </h1>
-
-              <p className="mt-1 max-w-2xl text-[10px] leading-relaxed text-slate-600">
-                Monitor and investigate AI-generated fraud and mule-account
-                alerts.
-              </p>
             </div>
 
             <button
@@ -163,7 +184,7 @@ function AlertCenter({ onNavigate }) {
       </div>
 
       {/* Main Content */}
-      <main className="mx-auto max-w-[1500px] p-5 lg:p-7">
+      <div className="space-y-6">
         {/* Stats */}
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <div className="rounded-xl border border-slate-800 bg-[#0B111B] p-4">
@@ -299,7 +320,7 @@ function AlertCenter({ onNavigate }) {
                       </span>
 
                       <span className="font-mono text-[9px] text-slate-500">
-                        {alert.amount}
+                        {alert.reference}
                       </span>
 
                       <span className="text-[9px] text-slate-700">
@@ -342,7 +363,11 @@ function AlertCenter({ onNavigate }) {
           {filteredAlerts.length === 0 && (
             <div className="rounded-xl border border-dashed border-slate-800 bg-[#0B111B] p-10 text-center">
               <p className="text-xs font-medium text-slate-400">
-                No alerts found
+                {loading
+                  ? "Loading alerts..."
+                  : error
+                  ? `Unable to load alerts: ${error}`
+                  : "No alerts found"}
               </p>
 
               <p className="mt-1 text-[9px] text-slate-600">
@@ -351,7 +376,8 @@ function AlertCenter({ onNavigate }) {
             </div>
           )}
         </div>
-      </main>
+        </div>
+      </div>
 
       {/* Alert Detail Modal */}
       {selectedAlert && (
@@ -401,7 +427,7 @@ function AlertCenter({ onNavigate }) {
                 </p>
 
                 <p className="mt-1 font-mono text-[10px] text-slate-300">
-                  {selectedAlert.amount}
+                  {selectedAlert.reference}
                 </p>
               </div>
             </div>

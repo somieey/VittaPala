@@ -1,29 +1,129 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import MainLayout from "../components/layout/mainlayout";
+import { analyzeTransaction } from "../services/api";
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8010/api";
+
+/**
+ * Convert a rule evidence object into readable text.
+ */
+const formatEvidence = (evidence) => {
+  if (!evidence || typeof evidence !== "object") {
+    return "";
+  }
+
+  return Object.entries(evidence)
+    .filter(([, value]) => {
+      if (value === null || value === undefined || value === "") {
+        return false;
+      }
+
+      if (Array.isArray(value)) {
+        return value.length > 0;
+      }
+
+      return true;
+    })
+    .slice(0, 4)
+    .map(([key, value]) => {
+      const label = key.replace(/_/g, " ");
+
+      const shown = Array.isArray(value)
+        ? value.slice(0, 5).join(", ")
+        : String(value);
+
+      return `${label}: ${shown}`;
+    })
+    .join("  ·  ");
+};
 
 function AccountInvestigation({
-  accountId: initialAccountId = "1",
+  accountId: initialAccountId = "",
   onNavigate,
 }) {
+  /*
+   * IMPORTANT:
+   * Never allow null / undefined / empty values to become
+   * a visible account ID.
+   *
+   * If no account ID is supplied, the page starts empty.
+   */
+  const normalizedInitialAccountId =
+    initialAccountId === null ||
+    initialAccountId === undefined ||
+    String(initialAccountId).trim() === "" ||
+    String(initialAccountId).toLowerCase() === "null" ||
+    String(initialAccountId).toLowerCase() === "undefined"
+      ? ""
+      : String(initialAccountId).trim();
+
   const [accountId, setAccountId] = useState(
-    String(initialAccountId)
+    normalizedInitialAccountId
   );
+
   const [searchedAccount, setSearchedAccount] = useState(
-    String(initialAccountId)
+    normalizedInitialAccountId
   );
+
   const [investigation, setInvestigation] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  // Live rule-based / AI analysis result.
+  const [analysis, setAnalysis] = useState(null);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+
+  // UI state for investigation actions.
+  const [actionMessage, setActionMessage] = useState("");
+  const [alertGenerated, setAlertGenerated] = useState(false);
+
+  /*
+   * Prevents stale analysis results from being applied
+   * after the user switches accounts.
+   */
+  const analyzedKeyRef = useRef(null);
+
+  /*
+   * Fetch account investigation.
+   */
   const fetchInvestigation = async (id) => {
+    const safeId = String(id ?? "").trim();
+
+    /*
+     * Empty / null / undefined account IDs are invalid.
+     *
+     * IMPORTANT:
+     * Clear the old investigation here so an old account does
+     * not remain visible underneath the error message.
+     */
+    if (
+      !safeId ||
+      safeId.toLowerCase() === "null" ||
+      safeId.toLowerCase() === "undefined"
+    ) {
+      setInvestigation(null);
+      setAnalysis(null);
+      setAnalysisError("");
+      setSearchedAccount("");
+      setError("Please enter a valid account ID.");
+      setActionMessage("");
+      setAlertGenerated(false);
+      analyzedKeyRef.current = null;
+      return;
+    }
+
     setLoading(true);
     setError("");
+    setActionMessage("");
+    setAlertGenerated(false);
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/api/accounts/${encodeURIComponent(id)}/investigation`
+        `${API_BASE_URL}/accounts/${encodeURIComponent(
+          safeId
+        )}/investigation`
       );
 
       if (!response.ok) {
@@ -33,10 +133,13 @@ function AccountInvestigation({
           const errorData = await response.json();
 
           if (errorData?.detail) {
-            message = errorData.detail;
+            message =
+              typeof errorData.detail === "string"
+                ? errorData.detail
+                : JSON.stringify(errorData.detail);
           }
         } catch {
-          // Keep the default error message.
+          // Keep default error.
         }
 
         throw new Error(message);
@@ -45,42 +148,243 @@ function AccountInvestigation({
       const data = await response.json();
 
       setInvestigation(data);
-      setSearchedAccount(id);
+      setSearchedAccount(safeId);
+
+      /*
+       * Keep the input synchronized with the account that
+       * was successfully investigated.
+       */
+      setAccountId(safeId);
+
+      /*
+       * Reset live analysis for the newly selected account.
+       */
+      setAnalysis(null);
+      setAnalysisError("");
+      analyzedKeyRef.current = null;
     } catch (err) {
       console.error("Account investigation error:", err);
 
       setInvestigation(null);
+      setAnalysis(null);
+      setAnalysisError("");
+      analyzedKeyRef.current = null;
+
       setError(
-        err.message || "Unable to connect to the investigation API."
+        err.message ||
+          "Unable to connect to the investigation API."
       );
     } finally {
       setLoading(false);
     }
   };
 
+  /*
+   * Initial account load.
+   *
+   * IMPORTANT:
+   * If no account ID is supplied, do NOT automatically load
+   * account 1.
+   *
+   * This fixes the original behaviour where the page opened
+   * with account 1 automatically.
+   */
   useEffect(() => {
-    fetchInvestigation("1");
-  }, []);
+    if (!normalizedInitialAccountId) {
+      setInvestigation(null);
+      setAnalysis(null);
+      setAnalysisError("");
+      setError("");
+      setSearchedAccount("");
+      setAccountId("");
+      setActionMessage("");
+      setAlertGenerated(false);
+      analyzedKeyRef.current = null;
 
+      return;
+    }
+
+    fetchInvestigation(normalizedInitialAccountId);
+  }, [normalizedInitialAccountId]);
+
+  /*
+   * Search handler.
+   */
   const handleSearch = (event) => {
     event.preventDefault();
 
     const value = accountId.trim();
 
-    if (!value) {
-      setError("Please enter an account ID.");
+    /*
+     * If the user removes the account ID and presses
+     * Investigate Account, completely clear the previous
+     * investigation instead of leaving it visible.
+     */
+    if (
+      !value ||
+      value.toLowerCase() === "null" ||
+      value.toLowerCase() === "undefined"
+    ) {
+      setInvestigation(null);
+      setAnalysis(null);
+      setAnalysisError("");
+      setSearchedAccount("");
+      setError("Please enter a valid account ID.");
+      setActionMessage("");
+      setAlertGenerated(false);
+      analyzedKeyRef.current = null;
+
       return;
     }
 
     fetchInvestigation(value);
   };
 
+  /*
+   * Handle account ID input changes.
+   */
+  const handleAccountIdChange = (event) => {
+    const value = event.target.value;
+
+    /*
+     * Never allow literal "null" or "undefined" to remain
+     * in the input.
+     */
+    if (
+      value.toLowerCase() === "null" ||
+      value.toLowerCase() === "undefined"
+    ) {
+      setAccountId("");
+      return;
+    }
+
+    setAccountId(value);
+
+    /*
+     * If the user starts editing the ID, remove an old
+     * validation error.
+     */
+    if (error) {
+      setError("");
+    }
+  };
+
   const account = investigation?.account;
-  const riskScore = investigation?.risk_score;
+
+  const persistedRiskScore =
+    investigation?.risk_score || null;
+
   const alerts = investigation?.alerts || [];
   const transactions = investigation?.transactions || [];
 
-  const riskLevel = (
+  /*
+   * Prefer the live engine result.
+   * Fall back to stored backend score.
+   */
+  const riskScore = analysis
+    ? {
+        risk_score_id: analysis.risk_score_id,
+        risk_score: analysis.risk_score,
+        mule_probability: analysis.mule_probability,
+        risk_level: analysis.risk_level,
+        model_version: analysis.model_version,
+        explanation: analysis.explanation,
+        scored_at: persistedRiskScore?.scored_at,
+      }
+    : persistedRiskScore;
+
+  /*
+   * Transactions are returned newest first.
+   *
+   * The latest transaction is used when the user manually
+   * runs the detection engine.
+   */
+  const selectedTransactionId =
+    transactions.length > 0
+      ? transactions[0].transaction_id
+      : null;
+
+  /*
+   * Manually run the live analysis.
+   *
+   * IMPORTANT:
+   * This is no longer automatically called when the page loads.
+   *
+   * That prevents every page visit from creating another
+   * risk-analysis POST and potentially increasing alert counts.
+   */
+  const runLiveAnalysis = async () => {
+    if (
+      selectedTransactionId === null ||
+      selectedTransactionId === undefined
+    ) {
+      setAnalysisError(
+        "No transaction is available for live analysis."
+      );
+      return;
+    }
+
+    const analysisKey = `${searchedAccount}:${selectedTransactionId}`;
+
+    analyzedKeyRef.current = analysisKey;
+
+    setAnalysisLoading(true);
+    setAnalysisError("");
+    setActionMessage("");
+
+    try {
+      const result = await analyzeTransaction(
+        selectedTransactionId
+      );
+
+      /*
+       * Ignore stale results if the user switched accounts while
+       * the request was running.
+       */
+      if (analyzedKeyRef.current !== analysisKey) {
+        return;
+      }
+
+      if (result) {
+        setAnalysis(result);
+
+        setActionMessage(
+          "Detection engine completed a fresh analysis."
+        );
+      } else {
+        setAnalysisError(
+          "Live analysis is not configured. Showing the stored risk result."
+        );
+      }
+    } catch (err) {
+      console.error("Risk analysis error:", err);
+
+      if (analyzedKeyRef.current !== analysisKey) {
+        return;
+      }
+
+      setAnalysisError(
+        err.message ||
+          "Unable to run the live risk analysis."
+      );
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
+  /*
+   * IMPORTANT:
+   *
+   * There is intentionally NO useEffect here that automatically
+   * calls runLiveAnalysis().
+   *
+   * Analysis only runs when the investigator explicitly clicks:
+   *
+   * - Run AI Analysis
+   * - Re-run Analysis
+   */
+
+  const riskLevel = String(
     riskScore?.risk_level || "unknown"
   ).toUpperCase();
 
@@ -106,9 +410,27 @@ function AccountInvestigation({
   };
 
   const explanation = riskScore?.explanation || {};
-  const reasons = explanation.reasons || [];
-  const triggeredRules = explanation.triggered_rules || [];
 
+  const reasons = Array.isArray(explanation.reasons)
+    ? explanation.reasons
+    : [];
+
+  const triggeredRules = Array.isArray(
+    explanation.triggered_rules
+  )
+    ? explanation.triggered_rules
+    : [];
+
+  const findings = Array.isArray(explanation.findings)
+    ? explanation.findings
+    : [];
+
+  const scoreBreakdown =
+    explanation.score_breakdown || {};
+
+  /*
+   * Transaction velocity.
+   */
   const transactionVelocity = useMemo(() => {
     if (!transactions.length) {
       return {
@@ -132,20 +454,27 @@ function AccountInvestigation({
     };
   }, [transactions]);
 
+  /*
+   * Unique connected accounts.
+   */
   const uniqueCounterparties = useMemo(() => {
     const ids = new Set();
 
     transactions.forEach((transaction) => {
       if (
         transaction.sender_account_id !== undefined &&
-        transaction.sender_account_id !== account?.account_id
+        transaction.sender_account_id !== null &&
+        String(transaction.sender_account_id) !==
+          String(account?.account_id)
       ) {
         ids.add(transaction.sender_account_id);
       }
 
       if (
         transaction.receiver_account_id !== undefined &&
-        transaction.receiver_account_id !== account?.account_id
+        transaction.receiver_account_id !== null &&
+        String(transaction.receiver_account_id) !==
+          String(account?.account_id)
       ) {
         ids.add(transaction.receiver_account_id);
       }
@@ -154,30 +483,14 @@ function AccountInvestigation({
     return ids.size;
   }, [transactions, account]);
 
-  const networkConnections = useMemo(() => {
-    const ids = new Set();
+  const networkConnections = uniqueCounterparties;
 
-    transactions.forEach((transaction) => {
-      if (
-        transaction.sender_account_id !== undefined &&
-        transaction.sender_account_id !== account?.account_id
-      ) {
-        ids.add(transaction.sender_account_id);
-      }
-
-      if (
-        transaction.receiver_account_id !== undefined &&
-        transaction.receiver_account_id !== account?.account_id
-      ) {
-        ids.add(transaction.receiver_account_id);
-      }
-    });
-
-    return ids.size;
-  }, [transactions, account]);
-
+  /*
+   * Behaviour deviation.
+   */
   const behaviourDeviation = useMemo(() => {
-    const signal = explanation.signals?.LARGE_TRANSACTION;
+    const signal =
+      explanation.signals?.LARGE_TRANSACTION;
 
     if (!signal?.ratio) {
       return null;
@@ -186,12 +499,20 @@ function AccountInvestigation({
     return Math.min(
       100,
       Math.round(
-        ((signal.ratio - 1) / Math.max(signal.ratio, 1)) * 100
+        ((Number(signal.ratio) - 1) /
+          Math.max(Number(signal.ratio), 1)) *
+          100
       )
     );
   }, [explanation]);
 
-  const formattedCurrency = (amount, currency = "INR") => {
+  /*
+   * Currency formatting.
+   */
+  const formattedCurrency = (
+    amount,
+    currency = "INR"
+  ) => {
     if (amount === null || amount === undefined) {
       return "—";
     }
@@ -207,6 +528,9 @@ function AccountInvestigation({
     }
   };
 
+  /*
+   * Date/time formatting.
+   */
   const formatDateTime = (value) => {
     if (!value) {
       return "—";
@@ -242,6 +566,44 @@ function AccountInvestigation({
     });
   };
 
+  /*
+   * Investigation action handlers.
+   */
+  const handleViewTransactions = () => {
+    document
+      .getElementById("recent-transactions")
+      ?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+
+    setActionMessage(
+      "Showing recent transaction activity."
+    );
+  };
+
+  const handleExploreNetwork = () => {
+    setActionMessage(
+      `Network investigation selected for account ${
+        account?.account_id ?? searchedAccount
+      }.`
+    );
+
+    if (typeof onNavigate === "function") {
+      onNavigate("Network Intelligence");
+    }
+  };
+
+  const handleGenerateAlert = () => {
+    setAlertGenerated(true);
+
+    setActionMessage(
+      `Alert prepared for account ${
+        account?.account_id ?? searchedAccount
+      }.`
+    );
+  };
+
   return (
     <MainLayout
       activePage="Account Investigation"
@@ -251,16 +613,18 @@ function AccountInvestigation({
     >
       <div className="space-y-6">
 
-        {/* Search Section */}
-        <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+        {/* =========================================================
+            SEARCH
+        ========================================================== */}
+        <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
           <div className="mb-4">
             <p className="text-sm font-semibold text-white">
               Investigate an Account
             </p>
 
             <p className="mt-1 text-xs text-slate-500">
-              Search by account ID to analyse suspicious behaviour and
-              transaction activity.
+              Search by account ID to analyse suspicious behaviour
+              and transaction activity.
             </p>
           </div>
 
@@ -276,7 +640,7 @@ function AccountInvestigation({
               <input
                 type="text"
                 value={accountId}
-                onChange={(event) => setAccountId(event.target.value)}
+                onChange={handleAccountIdChange}
                 placeholder="Enter account ID..."
                 className="w-full rounded-xl border border-slate-800 bg-[#070C14] py-3 pl-11 pr-4 text-sm text-white outline-none placeholder:text-slate-600 transition focus:border-cyan-400/40 focus:ring-2 focus:ring-cyan-400/10"
               />
@@ -287,14 +651,29 @@ function AccountInvestigation({
               disabled={loading}
               className="rounded-xl bg-cyan-400 px-6 py-3 text-sm font-semibold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {loading ? "Investigating..." : "Investigate Account"}
+              {loading
+                ? "Investigating..."
+                : "Investigate Account"}
             </button>
           </form>
         </section>
 
-        {/* Loading */}
+        {/* =========================================================
+            ACTION MESSAGE
+        ========================================================== */}
+        {actionMessage && (
+          <section className="rounded-xl border border-cyan-400/10 bg-cyan-400/5 px-4 py-3">
+            <p className="text-xs text-cyan-300">
+              {actionMessage}
+            </p>
+          </section>
+        )}
+
+        {/* =========================================================
+            LOADING
+        ========================================================== */}
         {loading && (
-          <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-8 text-center">
+          <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-8 text-center">
             <div className="mx-auto h-8 w-8 animate-spin rounded-full border-2 border-slate-700 border-t-cyan-400" />
 
             <p className="mt-4 text-sm text-slate-400">
@@ -303,7 +682,9 @@ function AccountInvestigation({
           </section>
         )}
 
-        {/* Error */}
+        {/* =========================================================
+            ERROR
+        ========================================================== */}
         {!loading && error && (
           <section className="rounded-2xl border border-red-400/20 bg-red-400/5 p-5">
             <p className="text-sm font-semibold text-red-300">
@@ -314,20 +695,26 @@ function AccountInvestigation({
               {error}
             </p>
 
-            <button
-              type="button"
-              onClick={() => fetchInvestigation(searchedAccount)}
-              className="mt-4 rounded-xl border border-red-400/20 bg-red-400/10 px-4 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-400/15"
-            >
-              Try Again
-            </button>
+            {searchedAccount && (
+              <button
+                type="button"
+                onClick={() =>
+                  fetchInvestigation(searchedAccount)
+                }
+                className="mt-4 rounded-xl border border-red-400/20 bg-red-400/10 px-4 py-2 text-xs font-semibold text-red-300 transition hover:bg-red-400/15"
+              >
+                Try Again
+              </button>
+            )}
           </section>
         )}
 
         {!loading && investigation && (
           <>
-            {/* Account Header */}
-            <section className="rounded-2xl border border-red-400/20 bg-[#0B111C] p-6 shadow-[0_0_40px_rgba(239,68,68,0.04)]">
+            {/* =====================================================
+                ACCOUNT HEADER
+            ====================================================== */}
+            <section className="rounded-2xl border border-red-400/20 bg-[#0B111B] p-6 shadow-[0_0_40px_rgba(239,68,68,0.04)]">
               <div className="flex flex-col gap-6 xl:flex-row xl:items-center xl:justify-between">
 
                 <div className="flex items-center gap-4">
@@ -356,12 +743,13 @@ function AccountInvestigation({
                       {account?.account_holder_name ||
                         "Unknown account holder"}
                       {" · "}
-                      {account?.bank_name || "Unknown bank"}
+                      {account?.bank_name ||
+                        "Unknown bank"}
                     </p>
                   </div>
                 </div>
 
-                {/* Risk Score */}
+                {/* Risk score */}
                 <div className="flex items-center gap-5">
                   <div className="text-right">
                     <p className="text-[10px] uppercase tracking-[0.15em] text-slate-600">
@@ -404,20 +792,24 @@ function AccountInvestigation({
               </div>
             </section>
 
-            {/* Account Details */}
+            {/* =====================================================
+                ACCOUNT DETAILS
+            ====================================================== */}
             <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 
-              <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                   Current Balance
                 </p>
 
                 <p className="mt-3 text-xl font-bold text-white">
-                  {formattedCurrency(account?.current_balance)}
+                  {formattedCurrency(
+                    account?.current_balance
+                  )}
                 </p>
               </div>
 
-              <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                   Account Type
                 </p>
@@ -427,7 +819,7 @@ function AccountInvestigation({
                 </p>
               </div>
 
-              <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                   KYC Status
                 </p>
@@ -445,7 +837,7 @@ function AccountInvestigation({
                 </p>
               </div>
 
-              <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                   Date Opened
                 </p>
@@ -457,7 +849,9 @@ function AccountInvestigation({
 
             </section>
 
-            {/* Fraud Behaviour Profile */}
+            {/* =====================================================
+                FRAUD BEHAVIOUR PROFILE
+            ====================================================== */}
             <section>
               <div className="mb-4">
                 <h2 className="text-sm font-semibold text-white">
@@ -465,13 +859,14 @@ function AccountInvestigation({
                 </h2>
 
                 <p className="mt-1 text-xs text-slate-500">
-                  Key behavioural signals identified by the detection engine.
+                  Key behavioural signals identified by the
+                  detection engine.
                 </p>
               </div>
 
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
 
-                <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+                <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                   <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                     Transaction Velocity
                   </p>
@@ -485,7 +880,7 @@ function AccountInvestigation({
                   </p>
                 </div>
 
-                <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+                <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                   <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                     Counterparties
                   </p>
@@ -495,11 +890,12 @@ function AccountInvestigation({
                   </p>
 
                   <p className="mt-2 text-xs text-slate-500">
-                    Unique connected accounts in returned transactions
+                    Unique connected accounts in returned
+                    transactions
                   </p>
                 </div>
 
-                <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+                <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                   <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                     Transaction Anomaly
                   </p>
@@ -515,7 +911,7 @@ function AccountInvestigation({
                   </p>
                 </div>
 
-                <div className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+                <div className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                   <p className="text-[10px] uppercase tracking-[0.12em] text-slate-600">
                     Network Connections
                   </p>
@@ -532,11 +928,125 @@ function AccountInvestigation({
               </div>
             </section>
 
-            {/* Why Flagged + Risk Assessment */}
+            {/* =====================================================
+                LIVE AI / DETECTION ENGINE
+            ====================================================== */}
+            <section className="rounded-2xl border border-cyan-400/10 bg-[#0B111B] p-5">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+
+                <div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <h2 className="text-sm font-semibold text-white">
+                      Detection Engine
+                    </h2>
+
+                    <span
+                      className={`rounded-full px-2 py-1 text-[9px] font-bold uppercase tracking-wider ring-1 ${
+                        analysisLoading
+                          ? "bg-cyan-400/10 text-cyan-300 ring-cyan-400/20"
+                          : analysis
+                          ? "bg-emerald-400/10 text-emerald-300 ring-emerald-400/20"
+                          : "bg-slate-400/10 text-slate-400 ring-slate-400/20"
+                      }`}
+                    >
+                      {analysisLoading
+                        ? "Running"
+                        : analysis
+                        ? "Completed"
+                        : "Stored Result"}
+                    </span>
+                  </div>
+
+                  <p className="mt-1 text-xs text-slate-500">
+                    Rule-based transaction analysis and explainable
+                    risk scoring.
+                  </p>
+
+                  {analysis?.model_version && (
+                    <p className="mt-2 text-[10px] uppercase tracking-wider text-slate-600">
+                      Engine {analysis.model_version}
+                    </p>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  disabled={
+                    analysisLoading ||
+                    selectedTransactionId === null ||
+                    selectedTransactionId === undefined
+                  }
+                  onClick={runLiveAnalysis}
+                  className="rounded-xl bg-cyan-400 px-5 py-2.5 text-xs font-bold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {analysisLoading
+                    ? "Analysing..."
+                    : "Run AI Analysis"}
+                </button>
+              </div>
+
+              {analysisError && (
+                <div className="mt-4 rounded-xl border border-amber-400/10 bg-amber-400/5 p-3">
+                  <p className="text-xs text-amber-300">
+                    {analysisError}
+                  </p>
+                </div>
+              )}
+
+              {analysis && (
+                <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-4">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-600">
+                      Rules Triggered
+                    </p>
+
+                    <p className="mt-2 text-2xl font-bold text-red-300">
+                      {findings.length ||
+                        triggeredRules.length ||
+                        0}
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-4">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-600">
+                      Risk Score
+                    </p>
+
+                    <p className="mt-2 text-2xl font-bold text-violet-300">
+                      {Number(
+                        analysis.risk_score || 0
+                      ).toFixed(0)}
+                      /100
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-4">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-600">
+                      Mule Probability
+                    </p>
+
+                    <p className="mt-2 text-2xl font-bold text-amber-300">
+                      {(
+                        Number(
+                          analysis.mule_probability || 0
+                        ) * 100
+                      ).toFixed(1)}
+                      %
+                    </p>
+                  </div>
+
+                </div>
+              )}
+            </section>
+
+            {/* =====================================================
+                WHY FLAGGED + RISK ASSESSMENT
+            ====================================================== */}
             <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
 
               {/* Why Flagged */}
-              <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <div className="mb-5">
                   <h2 className="text-sm font-semibold text-white">
                     Why This Account Was Flagged
@@ -547,19 +1057,108 @@ function AccountInvestigation({
                   </p>
                 </div>
 
-                {reasons.length > 0 ? (
+                {findings.length > 0 ? (
+                  <div className="space-y-3">
+                    {findings.map((finding, index) => {
+                      const findingSeverity = String(
+                        finding.severity || "unknown"
+                      ).toUpperCase();
+
+                      const evidenceText =
+                        formatEvidence(
+                          finding.evidence
+                        );
+
+                      return (
+                        <div
+                          key={`${finding.rule_id || "finding"}-${index}`}
+                          className="flex gap-3 rounded-xl border border-red-400/10 bg-red-400/5 p-4"
+                        >
+                          <span className="text-red-300">
+                            ●
+                          </span>
+
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="text-xs font-semibold text-slate-200">
+                                {finding.rule_name ||
+                                  finding.rule_id ||
+                                  `Detection Rule ${
+                                    index + 1
+                                  }`}
+                              </p>
+
+                              <span
+                                className={`rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ring-1 ${
+                                  riskLevelClasses[
+                                    findingSeverity
+                                  ] ||
+                                  riskLevelClasses.UNKNOWN
+                                }`}
+                              >
+                                {findingSeverity}
+                              </span>
+
+                              {typeof finding.confidence ===
+                                "number" && (
+                                <span className="text-[9px] uppercase tracking-wider text-slate-600">
+                                  confidence{" "}
+                                  {(
+                                    finding.confidence *
+                                    100
+                                  ).toFixed(0)}
+                                  %
+                                </span>
+                              )}
+                            </div>
+
+                            <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                              {finding.explanation ||
+                                finding.description ||
+                                "Detection rule triggered."}
+                            </p>
+
+                            {evidenceText && (
+                              <p className="mt-2 break-words font-mono text-[10px] leading-relaxed text-slate-600">
+                                {evidenceText}
+                              </p>
+                            )}
+
+                            {finding.transaction_ids &&
+                              finding.transaction_ids.length >
+                                0 && (
+                                <p className="mt-1 text-[10px] text-slate-600">
+                                  Transactions:{" "}
+                                  {finding.transaction_ids
+                                    .slice(0, 6)
+                                    .join(", ")}
+                                  {finding
+                                    .transaction_ids.length >
+                                    6 && " …"}
+                                </p>
+                              )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : reasons.length > 0 ? (
                   <div className="space-y-3">
                     {reasons.map((reason, index) => (
                       <div
                         key={`${reason}-${index}`}
                         className="flex gap-3 rounded-xl border border-red-400/10 bg-red-400/5 p-4"
                       >
-                        <span className="text-red-300">●</span>
+                        <span className="text-red-300">
+                          ●
+                        </span>
 
                         <div>
                           <p className="text-xs font-semibold text-slate-200">
                             {triggeredRules[index] ||
-                              `Detection Rule ${index + 1}`}
+                              `Detection Rule ${
+                                index + 1
+                              }`}
                           </p>
 
                           <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
@@ -572,30 +1171,31 @@ function AccountInvestigation({
                 ) : (
                   <div className="rounded-xl border border-slate-800 bg-slate-900/30 p-4">
                     <p className="text-xs text-slate-500">
-                      No explanation was returned by the risk engine.
+                      No explanation was returned by the risk
+                      engine.
                     </p>
                   </div>
                 )}
               </section>
 
               {/* Risk Assessment */}
-              <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+              <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
                 <div className="mb-5">
                   <h2 className="text-sm font-semibold text-white">
                     Risk Assessment
                   </h2>
 
                   <p className="mt-1 text-xs text-slate-500">
-                    Current risk score and rules evaluated by the detection
-                    engine.
+                    Current risk score and rules evaluated by the
+                    detection engine.
                   </p>
                 </div>
 
-                {Object.keys(explanation.score_breakdown || {}).length > 0 ? (
+                {Object.keys(scoreBreakdown).length > 0 ? (
                   <>
                     <div className="flex h-[180px] items-end gap-3 border-b border-slate-800 px-2 pb-3">
                       {Object.entries(
-                        explanation.score_breakdown || {}
+                        scoreBreakdown
                       ).map(([rule, value]) => (
                         <div
                           key={rule}
@@ -606,7 +1206,10 @@ function AccountInvestigation({
                             style={{
                               height: `${Math.min(
                                 100,
-                                Math.max(8, Number(value))
+                                Math.max(
+                                  8,
+                                  Number(value) || 0
+                                )
                               )}%`,
                             }}
                             title={`${rule}: ${value}`}
@@ -617,7 +1220,7 @@ function AccountInvestigation({
 
                     <div className="mt-3 flex gap-3 overflow-x-auto text-[10px] text-slate-600">
                       {Object.entries(
-                        explanation.score_breakdown || {}
+                        scoreBreakdown
                       ).map(([rule, value]) => (
                         <span
                           key={rule}
@@ -655,11 +1258,12 @@ function AccountInvestigation({
                   </span>
                 </div>
               </section>
-
             </div>
 
-            {/* Alerts */}
-            <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+            {/* =====================================================
+                ALERTS
+            ====================================================== */}
+            <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
               <div className="mb-5">
                 <h2 className="text-sm font-semibold text-white">
                   Fraud Alerts
@@ -684,7 +1288,10 @@ function AccountInvestigation({
                               {String(
                                 alert.alert_type || ""
                               )
-                                .replaceAll("_", " ")
+                                .replaceAll(
+                                  "_",
+                                  " "
+                                )
                                 .toUpperCase()}
                             </span>
 
@@ -703,7 +1310,9 @@ function AccountInvestigation({
                         </div>
 
                         <div className="shrink-0 text-[10px] text-slate-600">
-                          {formatDateTime(alert.created_at)}
+                          {formatDateTime(
+                            alert.created_at
+                          )}
                         </div>
                       </div>
                     </div>
@@ -716,10 +1325,12 @@ function AccountInvestigation({
               )}
             </section>
 
-            {/* Transactions */}
+            {/* =====================================================
+                TRANSACTIONS
+            ====================================================== */}
             <section
               id="recent-transactions"
-              className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5"
+              className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5"
             >
               <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
                 <div>
@@ -728,7 +1339,8 @@ function AccountInvestigation({
                   </h2>
 
                   <p className="mt-1 text-xs text-slate-500">
-                    Latest transaction activity associated with this account.
+                    Latest transaction activity associated with
+                    this account.
                   </p>
                 </div>
 
@@ -769,69 +1381,85 @@ function AccountInvestigation({
                     </thead>
 
                     <tbody>
-                      {transactions.map((transaction) => {
-                        const isOutgoing =
-                          transaction.sender_account_id ===
-                          account?.account_id;
+                      {transactions.map(
+                        (transaction) => {
+                          const isOutgoing =
+                            String(
+                              transaction.sender_account_id
+                            ) ===
+                            String(
+                              account?.account_id
+                            );
 
-                        return (
-                          <tr
-                            key={transaction.transaction_id}
-                            className="border-b border-slate-800/70 transition hover:bg-slate-900/30"
-                          >
-                            <td className="px-3 py-4">
-                              <p className="text-xs font-semibold text-slate-200">
-                                #{transaction.transaction_id}
-                              </p>
+                          return (
+                            <tr
+                              key={
+                                transaction.transaction_id
+                              }
+                              className="border-b border-slate-800/70 transition hover:bg-slate-900/30"
+                            >
+                              <td className="px-3 py-4">
+                                <p className="text-xs font-semibold text-slate-200">
+                                  #
+                                  {
+                                    transaction.transaction_id
+                                  }
+                                </p>
 
-                              <p className="mt-1 max-w-[280px] truncate text-[10px] text-slate-600">
-                                {transaction.description ||
-                                  "No description"}
-                              </p>
-                            </td>
+                                <p className="mt-1 max-w-[280px] truncate text-[10px] text-slate-600">
+                                  {transaction.description ||
+                                    "No description"}
+                                </p>
+                              </td>
 
-                            <td className="px-3 py-4">
-                              <span
-                                className={`text-xs font-bold ${
-                                  isOutgoing
-                                    ? "text-red-300"
-                                    : "text-emerald-300"
-                                }`}
-                              >
-                                {isOutgoing ? "-" : "+"}
-                                {formattedCurrency(
-                                  transaction.amount,
-                                  transaction.currency || "INR"
+                              <td className="px-3 py-4">
+                                <span
+                                  className={`text-xs font-bold ${
+                                    isOutgoing
+                                      ? "text-red-300"
+                                      : "text-emerald-300"
+                                  }`}
+                                >
+                                  {isOutgoing
+                                    ? "-"
+                                    : "+"}
+                                  {formattedCurrency(
+                                    transaction.amount,
+                                    transaction.currency ||
+                                      "INR"
+                                  )}
+                                </span>
+                              </td>
+
+                              <td className="px-3 py-4 text-xs text-slate-400">
+                                {transaction.channel ||
+                                  "—"}
+                              </td>
+
+                              <td className="px-3 py-4">
+                                <span className="text-[10px] font-semibold uppercase text-slate-500">
+                                  {isOutgoing
+                                    ? "Outgoing"
+                                    : "Incoming"}
+                                </span>
+                              </td>
+
+                              <td className="px-3 py-4">
+                                <span className="rounded-full bg-emerald-400/10 px-2 py-1 text-[9px] font-bold uppercase text-emerald-300">
+                                  {transaction.status ||
+                                    "unknown"}
+                                </span>
+                              </td>
+
+                              <td className="px-3 py-4 text-[10px] text-slate-500">
+                                {formatDateTime(
+                                  transaction.transaction_timestamp
                                 )}
-                              </span>
-                            </td>
-
-                            <td className="px-3 py-4 text-xs text-slate-400">
-                              {transaction.channel || "—"}
-                            </td>
-
-                            <td className="px-3 py-4">
-                              <span className="text-[10px] font-semibold uppercase text-slate-500">
-                                {isOutgoing
-                                  ? "Outgoing"
-                                  : "Incoming"}
-                              </span>
-                            </td>
-
-                            <td className="px-3 py-4">
-                              <span className="rounded-full bg-emerald-400/10 px-2 py-1 text-[9px] font-bold uppercase text-emerald-300">
-                                {transaction.status || "unknown"}
-                              </span>
-                            </td>
-
-                            <td className="px-3 py-4 text-[10px] text-slate-500">
-                              {formatDateTime(
-                                transaction.transaction_timestamp
-                              )}
-                            </td>
-                          </tr>
-                        );
-                      })}
+                              </td>
+                            </tr>
+                          );
+                        }
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -842,8 +1470,10 @@ function AccountInvestigation({
               )}
             </section>
 
-            {/* Investigation Actions */}
-            <section className="rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+            {/* =====================================================
+                INVESTIGATION ACTIONS
+            ====================================================== */}
+            <section className="rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
               <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
 
                 <div>
@@ -852,7 +1482,8 @@ function AccountInvestigation({
                   </h2>
 
                   <p className="mt-1 text-xs text-slate-500">
-                    Continue analysing this account and its connected network.
+                    Continue analysing this account and its
+                    connected network.
                   </p>
                 </div>
 
@@ -860,13 +1491,7 @@ function AccountInvestigation({
 
                   <button
                     type="button"
-                    onClick={() => {
-                      document
-                        .getElementById("recent-transactions")
-                        ?.scrollIntoView({
-                          behavior: "smooth",
-                        });
-                    }}
+                    onClick={handleViewTransactions}
                     className="rounded-xl border border-slate-700 bg-slate-900/60 px-4 py-2.5 text-xs font-semibold text-slate-300 transition hover:border-cyan-400/30 hover:text-cyan-300"
                   >
                     View Transactions
@@ -874,11 +1499,7 @@ function AccountInvestigation({
 
                   <button
                     type="button"
-                    onClick={() => {
-                      alert(
-                        `Network exploration for account ${account?.account_id} will be implemented in the network investigation module.`
-                      );
-                    }}
+                    onClick={handleExploreNetwork}
                     className="rounded-xl border border-slate-700 bg-slate-900/60 px-4 py-2.5 text-xs font-semibold text-slate-300 transition hover:border-cyan-400/30 hover:text-cyan-300"
                   >
                     Explore Network
@@ -886,14 +1507,33 @@ function AccountInvestigation({
 
                   <button
                     type="button"
-                    onClick={() => {
-                      alert(
-                        `Alert generation is ready for account ${account?.account_id}.`
-                      );
-                    }}
-                    className="rounded-xl bg-red-400 px-4 py-2.5 text-xs font-bold text-slate-950 transition hover:bg-red-300"
+                    onClick={runLiveAnalysis}
+                    disabled={
+                      analysisLoading ||
+                      selectedTransactionId ===
+                        null ||
+                      selectedTransactionId ===
+                        undefined
+                    }
+                    className="rounded-xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-2.5 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-400/15 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    Generate Alert
+                    {analysisLoading
+                      ? "Analysing..."
+                      : "Re-run Analysis"}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleGenerateAlert}
+                    className={`rounded-xl px-4 py-2.5 text-xs font-bold text-slate-950 transition ${
+                      alertGenerated
+                        ? "bg-emerald-400 hover:bg-emerald-300"
+                        : "bg-red-400 hover:bg-red-300"
+                    }`}
+                  >
+                    {alertGenerated
+                      ? "Alert Prepared ✓"
+                      : "Generate Alert"}
                   </button>
 
                 </div>

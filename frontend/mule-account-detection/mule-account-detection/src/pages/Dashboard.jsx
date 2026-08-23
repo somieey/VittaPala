@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { getAlerts, getDashboardData } from "../services/api";
 import MainLayout from "../components/layout/mainlayout";
 
 function Dashboard({ onNavigate }) {
@@ -11,16 +12,7 @@ function Dashboard({ onNavigate }) {
   const [alertsError, setAlertsError] = useState(null);
 
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/api/dashboard/stats")
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(
-            `Failed to load dashboard stats: ${response.status}`
-          );
-        }
-
-        return response.json();
-      })
+    getDashboardData()
       .then((data) => {
         setStats(data);
       })
@@ -34,18 +26,9 @@ function Dashboard({ onNavigate }) {
   }, []);
 
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/api/alerts/")
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(
-            `Failed to load alerts: ${response.status}`
-          );
-        }
-
-        return response.json();
-      })
+    getAlerts()
       .then((data) => {
-        setAlerts(data);
+        setAlerts(Array.isArray(data) ? data : []);
       })
       .catch((error) => {
         console.error("Alert loading error:", error);
@@ -66,7 +49,7 @@ function Dashboard({ onNavigate }) {
 
   return (
     <MainLayout
-      activePage="Command Center"
+      activePage="Dashboard"
       title="Command Center"
       subtitle="Real-time fraud intelligence and mule account monitoring"
       onNavigate={onNavigate}
@@ -76,7 +59,7 @@ function Dashboard({ onNavigate }) {
         {/* Welcome Section */}
         <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
           <h1 className="text-2xl font-bold text-white">
-            AI-Powered Fraud Intelligence Platform
+            VittaPala Fraud Intelligence Platform
           </h1>
 
           <p className="mt-2 text-sm text-slate-400">
@@ -90,8 +73,8 @@ function Dashboard({ onNavigate }) {
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
 
           {/* Total Accounts */}
-          <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
-            <p className="text-sm text-slate-500">
+          <div className="rounded-xl border border-slate-800 bg-[#0B111B] p-5">
+            <p className="text-[10px] uppercase tracking-[0.15em] text-slate-500">
               Total Accounts
             </p>
 
@@ -106,7 +89,7 @@ function Dashboard({ onNavigate }) {
 
           {/* High Risk Accounts */}
           <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-5">
-            <p className="text-sm text-red-300">
+            <p className="text-[10px] uppercase tracking-[0.15em] text-red-300">
               High Risk Accounts
             </p>
 
@@ -121,7 +104,7 @@ function Dashboard({ onNavigate }) {
 
           {/* Critical Alerts */}
           <div className="rounded-xl border border-orange-500/20 bg-orange-500/5 p-5">
-            <p className="text-sm text-orange-300">
+            <p className="text-[10px] uppercase tracking-[0.15em] text-orange-300">
               Critical Alerts
             </p>
 
@@ -136,7 +119,7 @@ function Dashboard({ onNavigate }) {
 
           {/* Mule Accounts */}
           <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-5">
-            <p className="text-sm text-cyan-300">
+            <p className="text-[10px] uppercase tracking-[0.15em] text-cyan-300">
               Mule Accounts
             </p>
 
@@ -272,7 +255,7 @@ function Dashboard({ onNavigate }) {
             <div className="mt-4 space-y-3">
 
               {alertsLoading && (
-                <p className="text-sm text-slate-500">
+                <p className="py-6 text-center text-sm text-slate-500">
                   Loading alerts...
                 </p>
               )}
@@ -286,8 +269,8 @@ function Dashboard({ onNavigate }) {
               {!alertsLoading &&
                 !alertsError &&
                 recentAlerts.length === 0 && (
-                  <p className="text-sm text-slate-500">
-                    No high-risk alerts found.
+                  <p className="py-6 text-center text-sm text-slate-500">
+                    No high-risk alerts to review.
                   </p>
                 )}
 

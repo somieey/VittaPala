@@ -3,7 +3,7 @@ import React from "react";
 function MuleProbability({
   probability = 92,
   classification = "LIKELY MULE",
-  model = "MuleGuard ML v1.0",
+  model = "VittaPala rule_based-0.4.0",
 }) {
   const safeProbability = Math.min(
     Math.max(Number(probability) || 0, 0),

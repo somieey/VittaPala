@@ -59,7 +59,7 @@ const levelStyles = {
 
 function RecentAlerts() {
   return (
-    <section className="rounded-2xl border border-slate-800 bg-[#0B111C]">
+    <section className="rounded-2xl border border-slate-800 bg-[#0B111B]">
       {/* Header */}
       <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
         <div>

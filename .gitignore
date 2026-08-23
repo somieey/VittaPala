@@ -1,6 +1,22 @@
-backend/venv/
-backend/.env
+# Python
 __pycache__/
 *.pyc
-frontend/node_modules/
+.pytest_cache/
+backend/venv/
+venv/
+
+# Secrets - never commit real environment files
+.env
+.env.local
+*.env
+!*.env.example
+!.env.example
+
+# Node / frontend
+node_modules/
+dist/
+.vite/
+
+# Editors
 .vscode/
+.idea/

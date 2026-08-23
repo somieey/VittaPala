@@ -35,7 +35,7 @@ function StatCard({
 
   return (
     <div
-      className={`group relative overflow-hidden rounded-2xl border border-slate-800 bg-[#0B111C] p-5 transition-all duration-300 hover:-translate-y-0.5 hover:border-slate-700 hover:shadow-xl ${styles.glow}`}
+      className={`group relative overflow-hidden rounded-2xl border border-slate-800 bg-[#0B111B] p-5 transition-all duration-300 hover:-translate-y-0.5 hover:border-slate-700 hover:shadow-xl ${styles.glow}`}
     >
       {/* Background glow */}
       <div className="pointer-events-none absolute -right-10 -top-10 h-28 w-28 rounded-full bg-cyan-500/5 blur-3xl transition-opacity duration-300 group-hover:opacity-100" />

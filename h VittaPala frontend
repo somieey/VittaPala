@@ -1,0 +1,17 @@
+[1mdiff --git a/backend/.env.example b/backend/.env.example[m
+[1mnew file mode 100644[m
+[1mindex 0000000..120b17d[m
+[1m--- /dev/null[m
+[1m+++ b/backend/.env.example[m
+[36m@@ -0,0 +1,11 @@[m
+[32m+[m[32m# VittaPala backend configuration.[m
+[32m+[m[32m# Copy to .env and fill in real values. NEVER commit .env.[m
+[32m+[m
+[32m+[m[32m# MySQL connection. utf8mb4 is applied by the application.[m
+[32m+[m[32mDATABASE_URL=mysql+pymysql://USER:PASSWORD@localhost:3306/vittapala[m
+[32m+[m
+[32m+[m[32m# Log every SQL statement. Leave false outside debugging.[m
+[32m+[m[32mSQL_ECHO=false[m
+[32m+[m
+[32m+[m[32m# Comma-separated origins allowed to call the API.[m
+[32m+[m[32mCORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173[m

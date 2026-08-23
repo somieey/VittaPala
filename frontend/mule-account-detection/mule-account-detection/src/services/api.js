@@ -53,7 +53,7 @@ export const getAccounts = async () => {
     return mockAccounts;
   }
 
-  return request("/accounts");
+  return request("/accounts/");
 };
 
 export const getAccountById = async (accountId) => {
@@ -97,7 +97,7 @@ export const searchAccounts = async (query) => {
   }
 
   return request(
-    `/accounts/search?q=${encodeURIComponent(query)}`
+    `/accounts/?q=${encodeURIComponent(query)}`
   );
 };
 
@@ -122,10 +122,8 @@ export const getTransactions = async (accountId) => {
   }
 
   const endpoint = accountId
-    ? `/transactions?accountId=${encodeURIComponent(
-        accountId
-      )}`
-    : "/transactions";
+    ? `/transactions/?account_id=${encodeURIComponent(accountId)}`
+    : "/transactions/";
 
   return request(endpoint);
 };
@@ -174,8 +172,9 @@ export const getRiskScore = async (accountId) => {
     };
   }
 
+  // The backend exposes the latest score through the investigation view.
   return request(
-    `/risk-score/${encodeURIComponent(accountId)}`
+    `/accounts/${encodeURIComponent(accountId)}/investigation`
   );
 };
 
@@ -212,7 +211,35 @@ export const investigateAccount = async (
   }
 
   return request(
-    `/investigation/${encodeURIComponent(accountId)}`
+    `/accounts/${encodeURIComponent(accountId)}/investigation`
+  );
+};
+
+/*
+|--------------------------------------------------------------------------
+| Fraud Detection / Loophole Engine
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Run the backend rule-based loophole engine for one transaction.
+ *
+ * POST /risk/analyze/{transaction_id}
+ *
+ * Returns the engine's RiskAnalysisResponse: risk_score (0-100),
+ * mule_probability (0-1), risk_level, detected_patterns and explanation.
+ *
+ * Returns null when no API base URL is configured, so callers keep their
+ * existing fallback display instead of showing invented risk data.
+ */
+export const analyzeTransaction = async (transactionId) => {
+  if (!API_BASE_URL) {
+    return null;
+  }
+
+  return request(
+    `/risk/analyze/${encodeURIComponent(transactionId)}`,
+    { method: "POST" }
   );
 };
 
@@ -272,14 +299,16 @@ export const getAlerts = async (filters = {}) => {
   }
 
   if (filters.type && filters.type !== "ALL") {
-    params.append("type", filters.type);
+    params.append("alert_type", String(filters.type).toLowerCase());
+  }
+
+  if (filters.accountId) {
+    params.append("account_id", filters.accountId);
   }
 
   const query = params.toString();
 
-  return request(
-    `/alerts${query ? `?${query}` : ""}`
-  );
+  return request(`/alerts/${query ? `?${query}` : ""}`);
 };
 
 export const getAlertById = async (alertId) => {
@@ -294,6 +323,46 @@ export const getAlertById = async (alertId) => {
   }
 
   return request(`/alerts/${alertId}`);
+};
+
+/**
+ * Move an alert through its lifecycle. PATCH /alerts/{id}/status
+ */
+export const updateAlertStatus = async (alertId, status, note) => {
+  if (!API_BASE_URL) {
+    return null;
+  }
+
+  return request(`/alerts/${encodeURIComponent(alertId)}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({ status, note }),
+  });
+};
+
+/**
+ * Transactions belonging to one account.
+ */
+export const getAccountTransactions = async (accountId) => {
+  if (!API_BASE_URL) {
+    await delay();
+    return mockTransactions.filter((t) => t.accountId === accountId);
+  }
+
+  return request(`/accounts/${encodeURIComponent(accountId)}/transactions`);
+};
+
+/**
+ * Create a transaction. POST /transactions/
+ */
+export const createTransaction = async (payload) => {
+  if (!API_BASE_URL) {
+    return null;
+  }
+
+  return request("/transactions/", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 };
 
 /*
@@ -479,7 +548,7 @@ export const getDashboardData = async () => {
     };
   }
 
-  return request("/dashboard");
+  return request("/dashboard/stats");
 };
 
 export default {
@@ -492,9 +561,14 @@ export default {
 
   getRiskScore,
   investigateAccount,
+  analyzeTransaction,
 
   getAlerts,
   getAlertById,
+  updateAlertStatus,
+
+  getAccountTransactions,
+  createTransaction,
 
   getNetwork,
 

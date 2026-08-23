@@ -45,7 +45,7 @@ function Sidebar({
 
           <div>
             <h1 className="text-sm font-semibold tracking-wide">
-              MULE<span className="text-cyan-400">GUARD</span>
+              VITTA<span className="text-cyan-400">PALA</span>
             </h1>
 
             <p className="mt-0.5 text-[10px] uppercase tracking-[0.18em] text-slate-500">

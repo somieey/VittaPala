@@ -43,7 +43,7 @@ function CustomTooltip({ active, payload }) {
   const data = payload[0].payload;
 
   return (
-    <div className="rounded-xl border border-slate-700 bg-[#0B111C] px-4 py-3 shadow-xl">
+    <div className="rounded-xl border border-slate-700 bg-[#0B111B] px-4 py-3 shadow-xl">
       <p className="text-xs font-medium text-slate-400">
         {data.name} Risk
       </p>
@@ -61,7 +61,7 @@ function CustomTooltip({ active, payload }) {
 
 function RiskOverview() {
   return (
-    <div className="h-full min-h-[360px] rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+    <div className="h-full min-h-[360px] rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>

@@ -25,7 +25,7 @@ function CustomTooltip({ active, payload, label }) {
   }
 
   return (
-    <div className="rounded-xl border border-slate-700 bg-[#0B111C] px-4 py-3 shadow-xl">
+    <div className="rounded-xl border border-slate-700 bg-[#0B111B] px-4 py-3 shadow-xl">
       <p className="mb-2 text-xs font-semibold text-slate-300">
         {label}
       </p>
@@ -52,7 +52,7 @@ function CustomTooltip({ active, payload, label }) {
 
 function RiskTrendChart() {
   return (
-    <div className="h-full min-h-[360px] rounded-2xl border border-slate-800 bg-[#0B111C] p-5">
+    <div className="h-full min-h-[360px] rounded-2xl border border-slate-800 bg-[#0B111B] p-5">
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
@@ -140,7 +140,7 @@ function RiskTrendChart() {
               activeDot={{
                 r: 5,
                 fill: "#22D3EE",
-                stroke: "#0B111C",
+                stroke: "#0B111B",
                 strokeWidth: 2,
               }}
             />
@@ -159,7 +159,7 @@ function RiskTrendChart() {
               activeDot={{
                 r: 5,
                 fill: "#F87171",
-                stroke: "#0B111C",
+                stroke: "#0B111B",
                 strokeWidth: 2,
               }}
             />
